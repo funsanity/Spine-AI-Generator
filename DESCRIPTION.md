@@ -2,12 +2,23 @@
 
 把一张 2D 立绘自动拆成部件、生成骨骼层级与网格权重，一键导出 **Cocos Creator / Unity (spine-unity) / Spine 编辑器** 各版本可直接使用的 Spine 资源。
 
+> 注：标题与仓库名保持英文。`Spine` 是专有名词（2D 骨骼动画工具），
+> 写成中文「脊柱」会让浏览器翻译把整页标题译错，也让仓库名对不上。
+
 ---
 
-## 简介（可直接用作仓库 About）
+## 仓库 About 栏用英文
+
+About 栏写英文，不要写中文。原因有两个：
+
+- **浏览器翻译会把仓库名一起翻掉。** Chrome 的整页翻译认不出 `Spine`（这里指的是
+  Spine 这套 2D 骨骼动画工具）是个专有名词，会按字面译成「脊柱」，
+  于是标题栏变成「脊柱人工智能生成器」——中文用户看到的仓库名是错的。
+  About 栏用英文，标题栏跟着一起被翻的概率就低得多。
+- 仓库名、README、README-EN 全都是英文，About 栏单独用中文也不一致。
 
 ```
-把一张 2D 立绘自动拆成部件、生成骨骼层级与网格权重，一键导出 Cocos Creator / Unity (spine-unity) / Spine 编辑器各版本可直接使用的 Spine 资源。
+Split a 2D illustration into parts, build a skeleton with mesh weights, and export Spine assets ready to drop into Cocos Creator, Unity (spine-unity), or the Spine editor.
 ```
 
 ## 完整介绍
