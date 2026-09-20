@@ -1,6 +1,7 @@
 {
   "name": "spine-tool-v1",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Spine 部件自动化工具 — P0 往返闭环",

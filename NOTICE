@@ -1,0 +1,25 @@
+Spine AI Generator
+Copyright 2026 Spine AI Generator contributors
+
+This product includes software developed by the Spine AI Generator contributors.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+---
+
+Third-party components
+
+The following are NOT distributed in this repository. They are fetched at
+install/setup time and remain under their own licenses:
+
+  MobileSAM            Apache-2.0   fetched by `npm run sam:setup` into
+                                    scripts/MobileSAM/ (gitignored)
+  sharp                Apache-2.0   npm dependency
+  playwright           Apache-2.0   npm dependency (dev)
+  express, multer,
+  @anthropic-ai/sdk    MIT          npm dependencies
+  dotenv               BSD-2-Clause npm dependency
+
+The Spine editor and its CLI are commercial software from Esoteric Software.
+This project only invokes an already-installed copy to produce `.spine` files;
+no Spine editor code is included or redistributed here.

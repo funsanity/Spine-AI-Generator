@@ -157,7 +157,7 @@ A: PNG 和 JPG，推荐使用透明背景的 PNG。
 └──────┬──────┘
        │
    ┌───▼───┐
-   │  AI   │ (Claude API / 中转站)
+   │  AI   │ (Anthropic 官方 / 自建网关)
    └───┬───┘
        │
 ┌──────▼──────┐
@@ -192,10 +192,10 @@ node bin/spine-tool.js roundtrip --project <file> --execute
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `PORT` | 服务端口 | 3000 |
-| `ANTHROPIC_BASE_URL` | API 中转站地址 | - |
+| `ANTHROPIC_BASE_URL` | 自建网关/中转服务地址，留空直连 Anthropic 官方 | - |
 | `ANTHROPIC_API_KEY` | API Key | - |
 | `OUTPUT_DIR` | 默认输出目录 | ./output |
 
 ## 许可证
 
-MIT
+见仓库根目录的 [LICENSE](../../LICENSE)（Apache-2.0）。

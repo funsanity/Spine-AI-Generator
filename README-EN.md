@@ -423,4 +423,9 @@ is handy for skeleton format conversion.
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE).
+
+Third-party components (MobileSAM, sharp, Playwright, …) are not distributed with this
+repository — they are fetched from upstream at install time and keep their own licenses;
+see [NOTICE](NOTICE). `.spine` files are produced by invoking a Spine editor CLI you already
+have installed; no Spine editor code is included or redistributed here.

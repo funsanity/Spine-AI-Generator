@@ -401,4 +401,8 @@ npm run test:e2e         # 慢，真调 API，验证完整链路
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE)。
+
+第三方组件（MobileSAM、sharp、Playwright 等）不随本仓库分发，装的时候各自从上游拉，
+各自的协议见 [NOTICE](NOTICE)。`.spine` 是调本机已装的 Spine 编辑器 CLI 生成的，
+本仓库不包含也不转发 Spine 编辑器的任何代码。
