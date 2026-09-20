@@ -1,0 +1,38 @@
+{
+  "name": "spine-tool-v1",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Spine 部件自动化工具 — P0 往返闭环",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "spine-tool": "./bin/spine-tool.js"
+  },
+  "scripts": {
+    "test": "node --test 'temp/test/*.test.js'",
+    "test:e2e": "E2E=1 node --test --test-timeout=1500000 temp/test/e2e.test.js",
+    "test:shot": "node --test --test-timeout=300000 temp/test/screenshot.test.js",
+    "verify": "node scripts/verify-artifacts.mjs",
+    "shot": "node scripts/screenshot-preview.mjs",
+    "check": "node bin/spine-tool.js doctor",
+    "roundtrip": "node bin/spine-tool.js roundtrip",
+    "web": "node server/index.js",
+    "sam:setup": "node server/sam/setup.mjs",
+    "sam:check": "node server/sam/setup.mjs --check",
+    "verify:sam": "node scripts/verify-sam-cut.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

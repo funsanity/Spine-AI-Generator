@@ -1,0 +1,47 @@
+{
+  "skeleton": { "spine": "4.2.33", "x": 0, "y": 0, "width": 200, "height": 300, "fps": 30 },
+  "bones": [
+    { "name": "root" },
+    { "name": "torso", "parent": "root", "length": 100 },
+    { "name": "arm", "parent": "torso", "length": 60 },
+    { "name": "hand", "parent": "arm", "length": 20 }
+  ],
+  "slots": [
+    { "name": "torso_slot", "bone": "torso", "attachment": "torso_img" },
+    { "name": "arm_slot", "bone": "arm", "attachment": "arm_img" },
+    { "name": "hand_slot", "bone": "hand", "attachment": "hand_img" }
+  ],
+  "ik": [
+    { "name": "arm_ik", "bones": ["arm", "hand"], "target": "arm", "mix": 1 }
+  ],
+  "skins": [
+    {
+      "name": "default",
+      "attachments": {
+        "torso_slot": { "torso_img": { "width": 80, "height": 100 } },
+        "arm_slot": { "arm_img": { "width": 30, "height": 60 } },
+        "hand_slot": { "hand_img": { "width": 20, "height": 20 } }
+      }
+    }
+  ],
+  "animations": {
+    "idle": {
+      "bones": {
+        "torso": { "rotate": [{ "time": 0, "angle": 0 }, { "time": 1, "angle": 5 }] },
+        "arm": { "rotate": [{ "time": 0, "angle": 0 }, { "time": 1, "angle": -12 }] }
+      },
+      "slots": {
+        "torso_slot": { "attachment": [{ "time": 0, "name": "torso_img" }] },
+        "arm_slot": { "attachment": [{ "time": 0, "name": "arm_img" }] }
+      },
+      "ik": {
+        "arm_ik/arm": [{ "time": 0, "mix": 1 }, { "time": 1, "mix": 0.5 }]
+      }
+    },
+    "wave": {
+      "bones": {
+        "arm": { "rotate": [{ "time": 0, "angle": 0 }, { "time": 1.5, "angle": 40 }] }
+      }
+    }
+  }
+}

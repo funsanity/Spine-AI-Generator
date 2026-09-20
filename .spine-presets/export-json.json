@@ -1,0 +1,17 @@
+{
+"class": "export-json",
+"extension": ".json",
+"format": "JSON",
+"prettyPrint": false,
+"nonessential": true,
+"cleanUp": true,
+"packAtlas": null,
+"packSource": "attachments",
+"packTarget": "perskeleton",
+"warnings": true,
+"version": null,
+"all": false,
+"output": "",
+"input": null,
+"open": false
+}

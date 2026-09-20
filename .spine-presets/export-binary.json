@@ -1,0 +1,11 @@
+{
+  "skeleton": {
+    "export": true,
+    "path": "",
+    "pretty": false,
+    "binary": true
+  },
+  "images": {
+    "export": false
+  }
+}

@@ -1,0 +1,1379 @@
+:root {
+  --primary: #007bff;
+  --primary-hover: #0056b3;
+  --secondary: #6c757d;
+  --success: #28a745;
+  --danger: #dc3545;
+  --bg: #f8f9fa;
+  --panel-bg: #ffffff;
+  --border: #dee2e6;
+  --text: #212529;
+  --text-muted: #6c757d;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/*
+ * 折叠靠 hidden 属性驱动。
+ * 但 .form-grid 是 display:grid、.bone-tree 也有自己的盒模型，
+ * 类选择器的优先级高于 UA 样式表里的 [hidden]，不加这条就收不起来。
+ */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.container {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/*
+ * 页头压成一行。
+ * 居中的大标题原本吃掉近 110px 首屏高度，
+ * 而这是个天天用的工具，标题只需要认得出来，不需要占版面。
+ */
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+header h1 {
+  font-size: 1.5em;
+  margin: 0;
+}
+
+/*
+ * 三列：输入 / 预览 / 近期记录。
+ * 记录列只用来认出「是哪一次」，缩略图 + 一行字就够，所以钉死在 200px——
+ * 给它 1fr 会从预览区抢走宽度，而预览区才是真正要看细节的地方。
+ */
+.main-grid {
+  display: grid;
+  /* minmax(0, …) 而不是 1fr：默认的 1fr 等价于 minmax(auto, 1fr)，
+     那个 auto 会让轨道被子元素的最小内容宽顶大——画布、超长日志行都能把布局撑开 */
+  grid-template-columns: 500px minmax(0, 1fr) 200px;
+  gap: 20px;
+  align-items: start;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 22px;
+}
+
+.panel h2 {
+  margin-bottom: 14px;
+  font-size: 1.3em;
+  border-bottom: 2px solid var(--primary);
+  padding-bottom: 8px;
+}
+
+.panel h3 {
+  margin-top: 0;
+  margin-bottom: 8px;
+  font-size: 1em;
+  color: var(--text-muted);
+}
+
+.form-section {
+  margin-bottom: 18px;
+}
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+/*
+ * 同类字段并排两列。
+ * 之前每个字段各占一行，输入面板要滚两屏才看得完，
+ * 而「输出目录 / 工程名称」「密度 / 外扩」这种成对的参数本来就该放一起看。
+ * 需要整行的（导出目标带说明、清理开关）用 .span-2 跨列。
+ */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 14px;
+  align-items: start;
+}
+
+.form-grid .span-2 {
+  grid-column: 1 / -1;
+}
+
+/* 网格里最后一行不再需要下间距，否则 section 之间会空出双份 */
+.form-grid > .form-group:nth-last-child(-n + 1) {
+  margin-bottom: 0;
+}
+
+/* 滑块在表单里要撑满列宽，默认宽度只有 129px，刻度太粗 */
+.form-group input[type="range"] {
+  width: 100%;
+  height: 4px;
+  margin: 6px 0 0;
+  border-radius: 2px;
+  background: var(--border);
+  outline: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.form-group input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary);
+  cursor: pointer;
+}
+
+.form-group input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: none;
+  cursor: pointer;
+}
+
+/* 滑块当前值：跟在标签后面，等宽字体避免数字跳动时标签抖 */
+.value-tag {
+  display: inline-block;
+  min-width: 42px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--primary);
+  font-size: 0.85em;
+  font-family: 'SF Mono', ui-monospace, monospace;
+  font-weight: 400;
+  text-align: center;
+}
+
+/*
+ * 表单里的开关。
+ * .toggle 那套颜色是给预览区的深色控制栏配的，白底面板上太浅；
+ * 而 .form-group label 的 display:block 也会盖掉它的 flex 对齐——
+ * 两者都要在这里显式覆盖。
+ */
+.form-group .toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+  color: var(--text);
+  font-size: 1em;
+  font-weight: 500;
+}
+
+.form-group .toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  flex: none;
+}
+
+.form-group code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg);
+  font-family: 'SF Mono', ui-monospace, monospace;
+  font-size: 0.95em;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 5px;
+  font-weight: 500;
+}
+
+input[type="text"],
+input[type="password"],
+textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+textarea {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.hint {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-top: 5px;
+}
+
+.upload-area {
+  border: 2px dashed var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.3s;
+  /*
+   * 淡灰底 + 浅棋盘格。
+   *
+   * 底必须是灰的：上传的素材常带透明通道（去背过的角色图），白底上
+   * 透明区和纯白内容分不出来——用户没法判断自己的图到底有没有透明。
+   * 灰底一衬，透明的地方立刻显出棋盘格。
+   *
+   * 棋盘格用两层 45° 渐变叠出来，格子 12px；色差压得很小（#e8e8e8/#f2f2f2），
+   * 只是给"这里有透明"一个视觉提示，不喧宾夺主。
+   */
+  background-color: #f2f2f2;
+  background-image:
+    linear-gradient(45deg, #e4e4e4 25%, transparent 25%, transparent 75%, #e4e4e4 75%),
+    linear-gradient(45deg, #e4e4e4 25%, transparent 25%, transparent 75%, #e4e4e4 75%);
+  background-size: 24px 24px;
+  background-position: 0 0, 12px 12px;
+}
+
+.upload-area:hover {
+  border-color: var(--primary);
+  background-color: #ececec;
+}
+
+.upload-placeholder svg {
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+
+.upload-placeholder p {
+  margin: 5px 0;
+}
+
+/*
+ * 预览图。
+ *
+ * 不铺不透明底：上传区本身是淡灰棋盘格，图的透明区透过去正好看得出边界。
+ * 铺白底的话透明区就看不出来了——而"这张图有没有透明"正是用户要判断的事。
+ * 只加一点圆角和描边，让图的边界不至于和棋盘格糊在一起。
+ */
+.preview-image {
+  max-width: 100%;
+  max-height: 70vh;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 8px;
+  outline: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.btn-primary,
+.btn-secondary {
+  width: 100%;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: white;
+}
+
+.btn-primary:hover {
+  background: var(--primary-hover);
+}
+
+.btn-secondary {
+  background: var(--secondary);
+  color: white;
+  margin-top: 20px;
+}
+
+.btn-secondary:hover {
+  background: #5a6268;
+}
+
+/*
+ * 状态栏的四种类型。
+ *
+ * 类名和 showStatus 里的 type 一一对应——之前这里写的是 loading/show，
+ * 而代码发的是 info/warning，于是那两类消息完全没有样式，
+ * 只在页面上留下几行裸字，看着像没加载完的文本。
+ */
+.status-box {
+  margin-top: 20px;
+  padding: 15px;
+  border-radius: 4px;
+  display: none;
+}
+
+.status-box.info {
+  background: #e3f2fd;
+  color: #1976d2;
+  border: 1px solid #90caf9;
+}
+
+.status-box.success {
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #81c784;
+}
+
+.status-box.warning {
+  background: #fff8e1;
+  color: #b26a00;
+  border: 1px solid #ffd54f;
+}
+
+.status-box.error {
+  background: #ffebee;
+  color: #c62828;
+  border: 1px solid #e57373;
+}
+
+.preview-area {
+  position: relative;
+  width: 100%;
+  height: 600px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0B0E14;
+}
+
+/* 预览区域（日志显示） */
+#preview {
+  width: 100%;
+  height: 100%;
+  padding: 20px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  display: flex;
+  flex-direction: column;
+}
+
+.empty-state {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty-state svg {
+  margin-bottom: 10px;
+}
+
+.controls {
+  margin-top: 20px;
+}
+
+.bone-tree {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 15px;
+  max-height: 300px;
+  overflow-y: auto;
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+}
+
+.bone-tree ul {
+  list-style: none;
+  padding-left: 20px;
+}
+
+.bone-tree li {
+  padding: 5px 0;
+  color: var(--text);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+  margin: 20px 0;
+}
+
+.stat-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 15px;
+  text-align: center;
+}
+
+.stat-label {
+  display: block;
+  font-size: 0.9em;
+  color: var(--text-muted);
+  margin-bottom: 5px;
+}
+
+.stat-value {
+  display: block;
+  font-size: 2em;
+  font-weight: bold;
+  color: var(--primary);
+}
+
+/* 窗口不够宽时，先牺牲记录列的位置（挪到底部横排），预览区宽度优先保住 */
+@media (max-width: 1500px) {
+  .main-grid {
+    grid-template-columns: 460px minmax(0, 1fr);
+  }
+
+  .history-panel {
+    grid-column: 1 / -1;
+  }
+
+  .history-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+    max-height: none;
+  }
+
+  .history-item {
+    width: 220px;
+  }
+}
+
+@media (max-width: 1200px) {
+  .main-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* API 配置浮动窗口 */
+.api-config {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 320px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+  display: none;
+}
+
+.api-config.show {
+  display: block;
+  animation: slideUp 0.3s ease;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.api-config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 500;
+}
+
+.api-config-header button {
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  line-height: 24px;
+}
+
+.api-config-header button:hover {
+  color: var(--danger);
+}
+
+.api-config-body {
+  padding: 16px;
+}
+
+.api-config-body .form-group {
+  margin-bottom: 12px;
+}
+
+.api-config-body .btn-primary {
+  margin-top: 8px;
+}
+
+/* API 配置触发按钮 */
+.api-config-trigger {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: white;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  transition: all 0.3s;
+  z-index: 999;
+}
+
+.api-config-trigger:hover {
+  background: var(--primary-hover);
+  transform: scale(1.1);
+}
+
+.api-config-trigger.hidden {
+  display: none;
+}
+
+/* 微调控制栏：走带一行、参数一行、开关一行，纵向堆叠 */
+.tweak-controls {
+  background: #1E293B;
+  border-top: 1px solid var(--border);
+  padding: 10px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: sticky;
+  bottom: 0;
+}
+
+.tweak-row {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* 走带 */
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-icon {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #0B0E14;
+  color: #F8FAFC;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-icon:hover {
+  background: #243247;
+  border-color: #38BDF8;
+}
+
+.btn-icon-primary {
+  background: #0C4A6E;
+  border-color: #38BDF8;
+  color: #E0F2FE;
+}
+
+/* 时间轴占满剩余宽度：拖拽精度直接取决于它有多长 */
+.timeline {
+  flex: 1;
+  min-width: 120px;
+  height: 4px;
+  border-radius: 2px;
+  background: #334155;
+  outline: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.timeline::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #38BDF8;
+  cursor: pointer;
+}
+
+.timeline::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #38BDF8;
+  border: none;
+  cursor: pointer;
+}
+
+/* 等宽字体：数字跳动时标签宽度不变，不会把后面的元素推来推去 */
+.time-label {
+  color: #94A3B8;
+  font-size: 12px;
+  font-family: 'SF Mono', ui-monospace, monospace;
+  white-space: nowrap;
+  min-width: 104px;
+  text-align: right;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #94A3B8;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle input {
+  accent-color: #38BDF8;
+  cursor: pointer;
+}
+
+.transport-hint {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.tweak-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tweak-group label {
+  color: #94A3B8;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.tweak-group select {
+  padding: 4px 8px;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #0B0E14;
+  color: #F8FAFC;
+  font-size: 13px;
+  min-width: 120px;
+}
+
+.tweak-group input[type="range"] {
+  width: 80px;
+  height: 4px;
+  border-radius: 2px;
+  background: #334155;
+  outline: none;
+  -webkit-appearance: none;
+}
+
+.tweak-group input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #38BDF8;
+  cursor: pointer;
+}
+
+.tweak-group input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #38BDF8;
+  cursor: pointer;
+  border: none;
+}
+
+.tweak-group span {
+  color: #F8FAFC;
+  font-size: 13px;
+  font-family: 'SF Mono', monospace;
+  min-width: 40px;
+}
+
+.btn-small {
+  padding: 6px 12px;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #0B0E14;
+  color: #F8FAFC;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-small:hover {
+  background: #1E293B;
+  border-color: #38BDF8;
+}
+
+/* Spine Canvas 样式 */
+/*
+ * 两块画布都绝对定位铺满预览区。
+ * 用 absolute 而不是普通块级：画布一旦参与固有尺寸计算，
+ * 它的宽度就会反过来决定容器宽度，而它的宽度又是从容器量来的——绕成死循环。
+ * 脱离文档流后画布只是被动铺满，不再向上传递任何尺寸诉求。
+ */
+#spineCanvas,
+#previewCanvas {
+  display: block;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #0B0E14;
+}
+
+.bone-item {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: 'SF Mono', 'Monaco', monospace;
+  font-size: 13px;
+}
+
+/*
+ * 日志浮动窗口。
+ *
+ * 和 API 配置窗口同一套视觉，但底部要让开那两个圆形按钮：
+ * 它们固定在右下角，窗口盖上去就点不到了——「关掉日志再开设置」这条最常见的
+ * 路径会直接卡死（点不动，只能先关日志，可你正是想开设置）。
+ *
+ * 让开的宽度 = 设置按钮 48 + 间距 16 + 日志按钮 48 = 112，再加外侧那 20px。
+ */
+.log-panel-modal {
+  position: fixed;
+  bottom: 20px;
+  right: calc(20px + 112px + 8px);
+  width: 560px;
+  max-width: calc(100vw - 180px);
+  background: #0B0E14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+  display: none;
+  overflow: hidden;
+}
+
+.log-panel-modal.show {
+  display: block;
+  animation: slideUp 0.3s ease;
+}
+
+/* 窗口里的日志区比常驻时高一些——既然专门打开了，就多给点地方 */
+.log-panel-modal .log-content {
+  max-height: min(420px, 60vh);
+}
+
+/*
+ * 标题栏要自己给浅色。
+ *
+ * 复用的是 .api-config-header——那套是给浅色背景面板写的，字色是深灰。
+ * 日志窗口是深色底（#0B0E14），深灰字直接看不见标题（只有关闭按钮浮在那儿）。
+ * 原来这层颜色由 .log-panel-header 提供，那个类随常驻面板一起删掉了。
+ */
+.log-panel-modal .api-config-header {
+  background: #1E293B;
+  color: #F8FAFC;
+  border-bottom: 1px solid #334155;
+}
+
+.log-panel-modal .api-config-header button {
+  color: #94A3B8;
+}
+
+.log-panel-modal .api-config-header button:hover {
+  color: #F8FAFC;
+}
+
+/* 日志按钮：和设置按钮同尺寸，往左让出一个身位，不压住它 */
+.log-trigger {
+  right: 84px;
+}
+
+.log-content {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 10px;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* 日志条目 */
+.log-entry {
+  padding: 6px 10px;
+  margin: 3px 0;
+  border-radius: 4px;
+  border-left: 3px solid transparent;
+  background: rgba(255, 255, 255, 0.02);
+  color: #F8FAFC;
+  transition: all 0.2s;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+}
+
+.log-entry:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 日志类型样式 */
+.log-connected {
+  border-left-color: #22D3EE;
+  color: #22D3EE;
+}
+
+.log-info {
+  border-left-color: #94A3B8;
+  color: #CBD5E1;
+}
+
+.log-progress {
+  border-left-color: #F59E0B;
+  color: #FCD34D;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.log-success {
+  border-left-color: #10B981;
+  color: #6EE7B7;
+  font-weight: 500;
+}
+
+.log-error {
+  border-left-color: #EF4444;
+  color: #FCA5A5;
+  background: rgba(239, 68, 68, 0.1);
+  font-weight: 500;
+}
+
+.log-warning {
+  border-left-color: #F97316;
+  color: #FDBA74;
+  background: rgba(249, 115, 22, 0.1);
+}
+
+/* 进度动画 */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+    background: rgba(245, 158, 11, 0.05);
+  }
+  50% {
+    opacity: 0.7;
+    background: rgba(245, 158, 11, 0.15);
+  }
+}
+
+/* 会话记录提示里的清除入口，做成文字链而不是按钮，避免和主操作抢注意力 */
+.btn-link {
+  padding: 0;
+  margin-left: 6px;
+  border: none;
+  background: none;
+  color: var(--primary);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.btn-link:hover {
+  color: var(--primary-hover);
+}
+
+/* ---------- 可折叠区块 ---------- */
+
+/*
+ * 折叠区块只剩一行标题时，上下都要留白。
+ * 「生成骨骼」是块通栏实心按钮，紧贴着一行小字会看成按钮的一部分。
+ */
+.collapsible-section {
+  margin-top: 14px;
+}
+
+/*
+ * 标题行 = 折叠开关 + 右侧附属项（摘要 / 操作按钮）。
+ * 整个标题都可点，而不是只点那个小三角——三角形是 12px 的点击目标，
+ * 一次点不中就得再瞄一次。
+ */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 8px;
+}
+
+.collapse-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 1em;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collapse-btn:hover {
+  color: var(--primary);
+}
+
+.caret {
+  display: inline-block;
+  font-size: 0.8em;
+  transition: transform 0.15s ease;
+}
+
+.collapse-btn[aria-expanded="true"] .caret {
+  transform: rotate(90deg);
+}
+
+/* 收起时的取值摘要：等宽字体，改参数时宽度不跳 */
+.section-note {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 0.8em;
+  font-family: 'SF Mono', ui-monospace, monospace;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.collapse-btn[aria-expanded="true"] ~ .section-note {
+  display: none;
+}
+
+/* 标题行里的小按钮：不能用 .btn-secondary，那是 width:100% 的主操作样式 */
+.btn-mini {
+  flex: none;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-mini:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: rgba(0, 123, 255, 0.05);
+}
+
+.btn-mini:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* 标签和它的小操作并排一行，按钮不能嵌在 label 里——label 会把点击转给输入框 */
+/* 复位链接紧跟在标签后面，而不是甩到面板最右边——它是标签的附属操作 */
+.label-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.label-row label {
+  margin-bottom: 5px;
+}
+
+.label-row .btn-link {
+  margin-left: 0;
+  font-size: 0.85em;
+}
+
+/* ---------- 近期记录 ---------- */
+
+.history-panel {
+  padding: 16px 14px;
+}
+
+.history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 1.05em;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 680px;
+  overflow-y: auto;
+}
+
+/*
+ * 一条记录 = 缩略图 + 工程名 + 一行副信息。
+ * 副信息用省略号截断而不是换行：列宽固定，换行会让每条高度不一样，
+ * 扫一眼找不到边界。
+ */
+.history-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.history-item:hover {
+  border-color: var(--primary);
+  background: rgba(0, 123, 255, 0.05);
+}
+
+/* 当前注入的那条要能一眼认出来，否则点完不知道停在哪一条 */
+.history-item.active {
+  border-color: var(--primary);
+  background: rgba(0, 123, 255, 0.08);
+}
+
+.history-thumb {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 4px;
+  object-fit: contain;
+  background: #0B0E14;
+}
+
+.history-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-name,
+.history-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+
+.history-name {
+  font-size: 0.86em;
+  font-weight: 500;
+}
+
+.history-sub {
+  font-size: 0.72em;
+  color: var(--text-muted);
+}
+
+/* 删除按钮平时不显眼，悬停到整条记录上才浮出来 */
+.history-del {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: all 0.15s;
+}
+
+.history-item:hover .history-del {
+  opacity: 1;
+}
+
+.history-del:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* ---------- 图像接口探测 ---------- */
+
+.probe-btn {
+  width: 100%;
+  margin-top: 8px;
+}
+
+/*
+ * .env 配置提示。一句话说明「不填也能跑」，不是报错，
+ * 所以用低对比度的灰字，别跟状态栏的红色错误抢注意力。
+ */
+.env-hint {
+  margin-top: 8px;
+  font-size: 0.78em;
+  line-height: 1.5;
+  color: var(--text-secondary, #666);
+}
+
+/*
+ * 重启服务器。和「测试图像接口」同宽同形，但用警示色描边：
+ * 它会真的把服务停掉再起来，不该看起来跟普通的查询按钮一样无害。
+ */
+.restart-row {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.restart-btn {
+  width: 100%;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.restart-btn:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+/*
+ * 探测结果是逐条的成败清单，条数不定且每条可能带一大段服务端原话，
+ * 所以给固定高度 + 滚动，不让它把配置面板顶出屏幕。
+ */
+.probe-result {
+  margin-top: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+
+.probe-row {
+  padding: 5px 7px;
+  margin-bottom: 4px;
+  border-radius: 4px;
+  border-left: 3px solid var(--border);
+  background: var(--bg);
+}
+
+.probe-row.ok {
+  border-left-color: var(--success);
+  background: #e8f5e9;
+}
+
+.probe-row.fail {
+  border-left-color: var(--danger);
+}
+
+.probe-label {
+  font-family: 'SF Mono', ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.probe-detail {
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.probe-thumb {
+  display: block;
+  width: 48px;
+  height: 48px;
+  margin-top: 4px;
+  border-radius: 3px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid var(--border);
+}
+
+/* 提示词模板设置弹窗 */
+.prompt-template-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.6);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.prompt-template-modal.show {
+  display: flex;
+}
+
+.modal-content {
+  background: var(--panel-bg);
+  border-radius: 8px;
+  width: 90%;
+  max-width: 700px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 1.1em;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.modal-close:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.template-category-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.template-tab {
+  padding: 8px 16px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.95em;
+  border-radius: 4px 4px 0 0;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.template-tab:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.template-tab.active {
+  color: var(--primary);
+  font-weight: 500;
+}
+
+.template-tab.active::after {
+  content: '';
+  position: absolute;
+  bottom: -10px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--primary);
+}
+
+.template-description {
+  color: var(--text-muted);
+  font-size: 0.9em;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-radius: 4px;
+}
+
+.modal-body textarea {
+  width: 100%;
+  min-height: 300px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.95em;
+  line-height: 1.6;
+  resize: vertical;
+  margin-bottom: 16px;
+}
+
+.modal-body textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.modal-actions .btn-secondary {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.modal-actions .btn-secondary:hover {
+  background: var(--border);
+}

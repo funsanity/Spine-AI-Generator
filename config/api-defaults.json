@@ -1,0 +1,5 @@
+{
+  "_comment": "API 接入点默认值。换服务商只改这一处——.env、前端表单、README 全都从这里取，不用翻着找。留空则回退到 Anthropic 官方直连。",
+  "baseURL": "",
+  "apiKeyPlaceholder": "sk-ant-..."
+}

@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spine AI Generator</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://unpkg.com/@esotericsoftware/spine-webgl@4.2/dist/iife/spine-webgl.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Spine AI Generator</h1>
+    </header>
+
+    <div class="main-grid">
+      <!-- 左侧：输入区 -->
+      <div class="panel input-panel">
+        <h2>输入配置</h2>
+
+        <section class="form-section">
+          <h3>1. 上传文件</h3>
+          <div class="upload-area" id="uploadArea">
+            <input type="file" id="fileInput" accept="image/*,.json,.atlas,.skel" hidden>
+            <div class="upload-placeholder">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p>点击或拖拽文件到此处</p>
+              <p class="hint">支持图片（PNG/JPG）或 Spine 文件（.json/.skel）</p>
+            </div>
+            <img id="previewImg" class="preview-image" style="display: none;">
+          </div>
+          <p class="hint" id="sessionHint" style="display: none;">
+            <span id="sessionHintText"></span>
+            <button id="clearSessionBtn" class="btn-link" type="button">清除记录</button>
+          </p>
+        </section>
+
+        <section class="form-section">
+          <h3 style="display:flex;align-items:baseline;gap:8px">2. 提示词<button type="button" id="promptSettingsBtn" class="btn-mini">设置</button></h3>
+          <textarea
+            id="prompt"
+            rows="3"
+            placeholder="例如：这是一个机械手臂，需要分成上臂、前臂、手掌三个部件，上臂是根部件"
+          ></textarea>
+          <p class="hint">描述部件结构和层级关系</p>
+        </section>
+
+        <!--
+          模型和输出默认展开（aria-expanded 就是这一节的默认值，
+          localStorage 里存过就以存的为准）。收起时标题右边留当前取值摘要。
+        -->
+        <section class="form-section">
+          <h3 class="section-head">
+            <button type="button" class="collapse-btn" data-collapse="modelFields"
+                    aria-expanded="true" aria-controls="modelFields">
+              <span class="caret" aria-hidden="true">▸</span>3. 模型
+            </button>
+            <span class="section-note" id="modelSummary"></span>
+          </h3>
+          <div id="modelFields">
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="modelSelect">模型</label>
+                <select id="modelSelect">
+                  <option value="claude-opus-5">claude-opus-5</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="reasoningSelect">推理等级</label>
+                <select id="reasoningSelect">
+                  <option value="default">默认（不开启）</option>
+                </select>
+              </div>
+            </div>
+            <p class="hint" id="modelNote">仅列出支持读图的模型</p>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <h3 class="section-head">
+            <button type="button" class="collapse-btn" data-collapse="outputFields"
+                    aria-expanded="true" aria-controls="outputFields">
+              <span class="caret" aria-hidden="true">▸</span>4. 输出
+            </button>
+            <span class="section-note" id="outputSummary"></span>
+          </h3>
+          <div class="form-grid" id="outputFields">
+            <div class="form-group span-2">
+              <label for="exportTarget">导出目标</label>
+              <select id="exportTarget">
+                <option value="cocos-3.8">Cocos Creator 3.8.x</option>
+              </select>
+              <p class="hint" id="targetNote">Cocos Creator 3.8.x 内置 Spine 3.8 运行时</p>
+            </div>
+
+            <div class="form-group">
+              <label for="outputDir">输出目录</label>
+              <input type="text" id="outputDir" placeholder="./output" value="./output">
+            </div>
+
+            <div class="form-group">
+              <label for="projectName">工程名称</label>
+              <input type="text" id="projectName" placeholder="generated" value="generated">
+            </div>
+
+            <!--
+              去背景。整条链路的前置步骤，缺了它后面全都白做：
+              切图切的是矩形，背景不透明时每个部件都是实心方块；
+              补图判的是 alpha，背景不透明就没有一处 alpha=0，一次都不会生效。
+            -->
+            <div class="form-group span-2">
+              <label class="toggle"><input type="checkbox" id="backgroundToggle" checked> 自动去除纯色背景</label>
+              <p class="hint">
+                从四边泛洪，只清和边缘连通的背景色。角色内部的白（眼白、高光、白衣）不会被误删。已带透明通道的图会跳过
+              </p>
+            </div>
+
+            <div class="form-group span-2">
+              <label class="toggle"><input type="checkbox" id="cleanToggle" checked> 生成前清理该工程的旧产物</label>
+              <p class="hint">产物固定落在 <code>输出目录/工程名/</code>。关掉则保留旧文件，同名重复生成会混在一起</p>
+            </div>
+          </div>
+        </section>
+
+        <!--
+          网格与补图是调优参数：默认值就能用，只有对着接缝做微调时才需要展开。
+          收起来之后标题行右边留一条当前取值的摘要，不展开也知道现在是什么设置。
+        -->
+        <section class="form-section collapsible-section">
+          <h3 class="section-head">
+            <button type="button" class="collapse-btn" data-collapse="meshFields"
+                    aria-expanded="false" aria-controls="meshFields">
+              <span class="caret" aria-hidden="true">▸</span>5. 网格与补图
+            </button>
+            <span class="section-note" id="meshSummary"></span>
+          </h3>
+          <div class="form-grid" id="meshFields" hidden>
+            <div class="form-group">
+              <label for="densityInput">网格密度 <span id="densityValue" class="value-tag">8</span></label>
+              <input type="range" id="densityInput" min="3" max="24" step="1" value="8">
+              <p class="hint">采样点数，越高形变越平滑</p>
+            </div>
+
+            <!--
+              补图外扩 / 边缘扩散：不再暴露给用户。
+
+              这两个参数原本是为了「让边缘有料可拉伸」而设的手动旋钮，但自从
+              补图的 alpha 放行改成按「内部孔洞 / 外部留白」泛洪判定之后，
+              外扩多少已经不影响最终透明轮廓——它只改 padding 的大小，
+              用户既看不出差别，也不知道该调成几。留着只会让人误以为调它
+              能解决白边（白边的真正来源是源图白底在抗锯齿边缘的反解误差，
+              和外扩无关）。
+
+              控件隐藏、值固定：外扩 8px（实测最优）、扩散 2 轮。
+              保留元素本身是因为 syncParamLabels 和 persistInputs 还引用它们。
+            -->
+            <input type="hidden" id="marginInput" value="8">
+            <input type="hidden" id="bleedInput" value="2">
+
+            <!--
+              紧贴切图。默认那套拆图规则要求"部件互不重叠、拼起来还原原图"，
+              结果是头发那块框里连带一整片额头，头发一动额头跟着动。
+              这一档改成只框部件独占的区域，让被遮的部件去补上缺口。
+            -->
+            <div class="form-group span-2">
+              <label class="toggle">
+                <input type="checkbox" id="tightCutToggle" checked> 部件紧贴轮廓切分
+              </label>
+              <p class="hint">
+                bbox 只框部件独占的区域。例：头发只切头发，额头留给额头——头发晃动时额头才不跟着动。需配合补图，切开处才会补全
+              </p>
+            </div>
+
+            <!--
+              MobileSAM 像素级部件分割。AI 给的 bbox 只说明"东西大概在这块"，
+              真正把它变成逐像素轮廓的是这个模型。有了它，西红柿切图里不再
+              有篮圈和提手——被挡住的地方留成透明，正好交给补图。
+              环境没装时自动退回多边形轮廓，不影响生成。
+            -->
+            <div class="form-group span-2">
+              <label class="toggle">
+                <input type="checkbox" id="samToggle" checked> MobileSAM
+              </label>
+              <p class="hint" id="samHint">
+                用分割模型把每个部件的轮廓描到像素级，切图里不再混进邻件。纯本地计算，实测每张图约 0.3 秒
+              </p>
+            </div>
+
+            <!--
+              剪影吸附。AI 给的是矩形框，部件几乎从来不是矩形——框的下端常常
+              伸进隔壁部件，那部分内容会跟着这个部件一起动，看起来就是缺块。
+              吸附在框内找出真正连着的那块不透明区域，把框收紧到它。
+            -->
+            <div class="form-group span-2">
+              <label class="toggle">
+                <input type="checkbox" id="snapToggle" checked> 剪影吸附
+              </label>
+              <p class="hint">
+                把 AI 给的矩形框收紧到部件自己的轮廓，剔掉框里带进来的邻件内容。纯本地计算，不额外调用模型。关掉则按矩形框直接切
+              </p>
+            </div>
+
+            <!--
+              部件补图。切出来的部件周围用图像模型补成完整细节，原图被切走的
+              地方也补全——头发单独切出去之后，剩下的身体得是个完整的光头，
+              而不是一块缺口。
+            -->
+            <div class="form-group span-2">
+              <label class="toggle">
+                <input type="checkbox" id="inpaintToggle" checked> 启用部件补图
+              </label>
+              <p class="hint">
+                补全切出的部件和原图缺口，动画时不再露透明边。<strong>每个部件 1 次图像调用（实测约 20 秒），会明显增加耗时与费用</strong>
+              </p>
+            </div>
+
+            <div class="form-group span-2" id="imageModelGroup">
+              <label for="imageModelSelect">补图模型</label>
+              <select id="imageModelSelect">
+                <option value="">未探测，请先在 ⚙️ 里测试图像接口</option>
+              </select>
+              <p class="hint" id="imageModelNote">
+                列表来自当前 API 服务，未探测过的模型标为「未验证」
+              </p>
+            </div>
+
+            <div class="form-group" id="maxInpaintGroup">
+              <label for="maxInpaintInput">最大补图次数</label>
+              <input type="number" id="maxInpaintInput" value="2" min="1" max="5" step="1">
+              <p class="hint">每个部件最多补几次（1-5），模型自动审核结果，不合格时重补。次数越多质量越高，费用和耗时也成倍增加</p>
+            </div>
+          </div>
+        </section>
+
+        <button id="generateBtn" class="btn-primary">
+          🚀 生成骨骼
+        </button>
+
+        <!--
+          只在补图有失败部件时出现。
+          整条流程重跑要 5 分钟，还会把已成功的部件再补一遍（白花钱），
+          所以给一个只补失败那几个的入口。
+        -->
+        <button id="retryInpaintBtn" class="btn-secondary" hidden>
+          🔁 重跑补图
+        </button>
+
+
+        <div id="status" class="status-box"></div>
+      </div>
+
+      <!-- 右侧：预览区 -->
+      <div class="panel preview-panel">
+        <h2>预览</h2>
+
+        <div id="previewArea" class="preview-area">
+          <canvas id="spineCanvas" style="display: none;"></canvas>
+          <canvas id="previewCanvas" width="600" height="600" style="display: none;"></canvas>
+          <div id="emptyState" class="empty-state">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <p>等待生成...</p>
+          </div>
+        </div>
+
+        <!-- 播放与微调控制栏 -->
+        <div id="tweakControls" class="tweak-controls" style="display: none;">
+
+          <!-- 走带：逐帧是刚性拼合调试的核心，动画跑着看不出接缝是哪一帧裂的 -->
+          <div class="transport">
+            <button id="stopBtn" class="btn-icon" title="停止并回到第 0 帧">■</button>
+            <button id="prevFrameBtn" class="btn-icon" title="上一帧">◀|</button>
+            <button id="playPauseBtn" class="btn-icon btn-icon-primary" title="播放 / 暂停">▶</button>
+            <button id="nextFrameBtn" class="btn-icon" title="下一帧">|▶</button>
+            <input type="range" id="timeline" class="timeline" min="0" max="1000" step="1" value="0">
+            <span id="timeLabel" class="time-label">0.00s / 0.00s</span>
+          </div>
+
+          <div class="tweak-row">
+            <div class="tweak-group">
+              <label for="animationSelect">动画</label>
+              <select id="animationSelect">
+                <option value="">选择动画</option>
+              </select>
+            </div>
+            <div class="tweak-group">
+              <label for="scaleSlider">缩放</label>
+              <input type="range" id="scaleSlider" min="0.1" max="4" step="0.05" value="1">
+              <span id="scaleValue">1.0x</span>
+            </div>
+            <div class="tweak-group">
+              <label for="speedSlider">速度</label>
+              <input type="range" id="speedSlider" min="0.1" max="3" step="0.05" value="1">
+              <span id="speedValue">1.0x</span>
+            </div>
+          </div>
+
+          <div class="tweak-row">
+            <label class="toggle"><input type="checkbox" id="loopToggle" checked> 循环</label>
+            <label class="toggle"><input type="checkbox" id="bonesToggle"> 骨骼</label>
+            <label class="toggle"><input type="checkbox" id="wireToggle"> 网格线框</label>
+            <label class="toggle"><input type="checkbox" id="bboxToggle"> 对齐诊断</label>
+            <button id="resetViewBtn" class="btn-small">重置视图</button>
+            <span class="hint transport-hint">滚轮缩放 · 拖拽平移 · 空格播放/暂停 · ←→ 逐帧</span>
+          </div>
+        </div>
+
+        <div id="controls" class="controls" style="display: none;">
+          <!--
+            骨骼名单动辄十几行，平时只需要知道「有多少根」，
+            所以树收起来、统计常驻。打开输出目录放在同一行右侧：
+            看完统计紧接着就是去 Finder 里拿产物。
+          -->
+          <h3 class="section-head">
+            <button type="button" class="collapse-btn" data-collapse="boneTree"
+                    aria-expanded="false" aria-controls="boneTree">
+              <span class="caret" aria-hidden="true">▸</span>骨骼层级
+            </button>
+            <button type="button" id="openOutputBtn" class="btn-mini"
+                    title="在系统文件管理器中打开本次的输出目录">📂 打开输出目录</button>
+          </h3>
+          <div id="boneTree" class="bone-tree" hidden></div>
+
+          <div class="stats">
+            <div class="stat-item">
+              <span class="stat-label">骨骼数量</span>
+              <span id="boneCount" class="stat-value">0</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">槽位数量</span>
+              <span id="slotCount" class="stat-value">0</span>
+            </div>
+          </div>
+
+          <button id="exportBtn" class="btn-secondary">
+            导出
+          </button>
+        </div>
+      </div>
+
+      <!--
+        最右侧：近期生成记录。
+        窄列就够——一行只要认得出是哪一次（缩略图 + 工程名 + 时间），
+        点进去才需要细节，所以详情一律交给注入后的主区域去展示。
+      -->
+      <div class="panel history-panel">
+        <h2 class="history-head">
+          <span>近期记录</span>
+          <button type="button" id="clearHistoryBtn" class="btn-link" title="清空全部记录">清空</button>
+        </h2>
+        <div id="historyList" class="history-list"></div>
+        <p class="hint" id="historyEmpty">生成成功后会自动记在这里，点击可重新载入</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- API 配置浮动窗口 -->
+  <div id="apiConfig" class="api-config">
+    <div class="api-config-header">
+      <span>⚙️ API 配置</span>
+      <button id="closeApiConfig">×</button>
+    </div>
+    <div class="api-config-body">
+      <div class="form-group">
+        <label for="apiKey">API Key</label>
+        <input
+          type="password"
+          id="apiKey"
+          placeholder="输入你的 API Key"
+        >
+      </div>
+      <div class="form-group">
+        <label for="baseURL">Base URL</label>
+        <input
+          type="text"
+          id="baseURL"
+          placeholder="留空则直连 Anthropic 官方"
+        >
+      </div>
+      <button id="saveApiConfig" class="btn-primary">保存</button>
+      <!-- 保存会同时写 localStorage 和 .env；这里说明 .env 里已经有什么 -->
+      <div id="envConfigHint" class="env-hint" hidden></div>
+
+      <!--
+        图像接口探测。部件补图要靠图像生成接口，而各家 API 服务对模型的封装不统一，
+        必须实测才知道哪条路能用。放在这里是因为 key 就在这个面板里。
+      -->
+      <button id="probeImageBtn" class="btn-mini probe-btn" type="button">
+        🔍 测试图像生成接口
+      </button>
+      <div id="probeResult" class="probe-result" hidden></div>
+
+      <!--
+        重启服务端。
+        服务进程把代码和 .env 都读在内存里，改完不重启页面上看不出来
+        （连着一个几小时前起的进程，改了不生效，很难查）。
+        放在这个面板是因为改 .env 就在上面几行，改完顺手点一下。
+      -->
+      <div class="restart-row">
+        <button id="restartServerBtn" class="btn-mini restart-btn" type="button">
+          🔄 重启服务器
+        </button>
+        <div id="restartResult" class="env-hint" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <!--
+    日志浮动窗口。
+
+    原来它常驻在左侧表单下方，占掉一大块纵向空间，而生成日志只有出错时才有人看。
+    改成按需打开：左下角一个按钮，点开才显示。
+
+    内容区仍然是 #logContent，SSE 一直在往里写——窗口关着的时候日志也在记，
+    打开就能看到进度的全部历史，而不是"从打开这一刻开始"。
+  -->
+  <div id="logPanel" class="log-panel-modal">
+    <div class="api-config-header">
+      <span>📋 生成日志</span>
+      <button id="closeLogPanel" title="关闭">×</button>
+    </div>
+    <div id="logContent" class="log-content"></div>
+  </div>
+
+  <!-- 日志按钮，放在设置按钮左边 -->
+  <button id="openLogPanel" class="api-config-trigger log-trigger" title="生成日志">📋</button>
+
+  <!-- 打开 API 配置按钮 -->
+  <button id="openApiConfig" class="api-config-trigger">⚙️</button>
+
+  <script src="renderer.js" type="module"></script>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
+
+  <!-- 提示词模板设置弹窗 -->
+  <div id="promptTemplateModal" class="prompt-template-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>提示词模板设置</span>
+        <button id="closeTemplateModal" class="modal-close" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="template-category-tabs">
+          <button class="template-tab active" data-category="character">角色类</button>
+          <button class="template-tab" data-category="prop">道具类</button>
+          <button class="template-tab" data-category="effect">特效类</button>
+          <button class="template-tab" data-category="item">物品类</button>
+        </div>
+        <p class="template-description" id="templateDescription"></p>
+        <textarea 
+          id="templateContent" 
+          rows="12" 
+          placeholder="编辑该类别的默认提示词模板..."
+        ></textarea>
+        <div class="modal-actions">
+          <button id="resetTemplateBtn" class="btn-secondary">恢复默认</button>
+          <button id="saveTemplateBtn" class="btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>

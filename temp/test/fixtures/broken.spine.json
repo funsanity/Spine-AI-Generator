@@ -1,0 +1,15 @@
+{
+  "skeleton": { "spine": "4.2.33" },
+  "bones": [
+    { "name": "a", "parent": "ghost" },
+    { "name": "b", "parent": "a" }
+  ],
+  "slots": [
+    { "name": "s1", "bone": "nope" },
+    { "name": "s2", "bone": "b", "attachment": "ghost_img" }
+  ],
+  "skins": [{ "name": "default", "attachments": {} }],
+  "animations": {
+    "idle": { "bones": { "missing_bone": { "rotate": [{ "time": 0, "angle": 0 }] } } }
+  }
+}

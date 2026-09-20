@@ -1,0 +1,11 @@
+Wand.png
+size:512,256
+filter:Linear,Linear
+pma:true
+scale:0.8
+Wand
+bounds:2,2,172,239
+offsets:50,12,280,280
+glow_spot
+bounds:176,81,191,160
+offsets:15,0,220,160

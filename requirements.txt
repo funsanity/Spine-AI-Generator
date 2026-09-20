@@ -1,0 +1,26 @@
+# MobileSAM 像素级分割的可选依赖
+#
+# 只有要用「像素级分割」这个可选功能时才需要装。不用它的话，本工具
+# 靠 AI 多边形轮廓切图，纯 Node 环境就能跑，这里一个都不装。
+#
+# 安装（自动，推荐）：
+#   npm run sam:setup
+# 它会建虚拟环境、装下面的依赖、拉 MobileSAM 仓库和权重，
+# 全部放在 ~/.spine-tool/mobilesam，不污染项目目录。
+#
+# 手动装也可以，直接对着这个文件：
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# 版本按实测可用的组合锁定（macOS arm64 / Python 3.11）：
+#   torch 2.8.0 + torchvision 0.23.0 是配套的一对，单独升一个会 ImportError。
+#   MPS（Apple GPU）加速需要 torch >= 2.0，2.8.0 实测可用。
+
+torch==2.8.0
+torchvision==0.23.0
+numpy==2.0.2
+opencv-python-headless==5.0.0.93
+pillow==11.3.0
+# timm 是 MobileSAM 上游 requirements.txt 漏掉的那个，
+# 少了它 `import mobile_sam` 直接 ModuleNotFoundError。
+timm==1.0.29
+
