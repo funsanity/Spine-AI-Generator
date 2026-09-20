@@ -1,5 +1,7 @@
 # Spine AI Generator
 
+**English | [中文](README.md)**
+
 A local tool that **splits a 2D illustration into parts, builds a skeleton, and exports a Spine project** — automatically.
 
 Upload an image → a vision model figures out which parts exist and what covers what → pixel-level
@@ -10,22 +12,14 @@ cutout → bone hierarchy is inferred → one click exports the `.json` / `.atla
   <img src="docs/images/demo.gif" width="820" alt="Dashboard demo: assembled preview, bone hierarchy, idle animation playing">
 </p>
 
-<p align="center">
-  <sub>Recorded from the real dashboard, unedited. Left column is the input config; centre is the
-  assembled preview (toggle parts / bones / wireframe, play the idle animation); right is the
-  generation log and recent sessions.</sub>
-</p>
-
-<sub>Can't view the GIF? [Download the mp4](docs/images/demo.mp4) (750KB, better quality).</sub>
-
 ---
 
 ## Contents
 
 - [What this is](#what-this-is)
 - [Results](#results)
-- [Pipeline](#pipeline) ← the full input → bbox → SAM → mesh → skeleton → export chain
-- [Minimal viable scope](#minimal-viable-scope) ← read this if you just want output
+- [Pipeline](#pipeline)
+- [Minimal viable scope](#minimal-viable-scope)
 - [Quick start](#quick-start)
 - [Workflow](#workflow)
 - [Output layout](#output-layout)
