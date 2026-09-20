@@ -227,6 +227,48 @@ The key is **describing structure and pivots**, not describing the picture:
    (no parts, no hierarchy, no pivots)
 ```
 
+### Built-in templates
+
+All four live in `config/prompt-templates.json` and are editable in the UI. What they control is
+not *what to draw* but **how to split, how to set parents, and where the pivots go**:
+
+| Template | Splitting strategy | Pivots | Part count |
+|---|---|---|---|
+| Character | Body is the root; clothing layered inside-out; hand and held prop **must be merged** (split them and you get a guaranteed gap) | Head at the neck base, upper arm at the shoulder, forearm at the elbow, hand at the wrist | 6–15 |
+| Prop | Main body is the root; split by **real motion** (a wheel that turns, a trigger that pulls) | On the actual axis of rotation | 4–10 |
+| Effect | Layered by distance from the core; the outermost layer draws on top | Almost always the geometric centre, so scaling and rotating expands outward naturally | 3–8 |
+| Item | **Only split what moves**; a purely decorative object is one part | Hinge / axis | 1–5 |
+
+Three rules are shared by all four templates and live in their body text:
+
+- **Hierarchy**: "the thing on top is the child, the thing underneath is the parent" — the occluded
+  part is the parent (drawn first), the occluder is the child (drawn on top)
+- **bbox padding**: extend 3–5 px past the visible content so the outline is included; better to
+  over-frame by 5 px than under-frame by 1 px
+- **Pivots**: place them at the real joint, not at the part's geometric centre
+
+### One measured run
+
+This is the configuration used for the full end-to-end run on `test_assets/12.png` in this repo;
+every field maps to something in the UI:
+
+| Item | Value |
+|---|---|
+| Analysis model | `claude-opus-5` (vision model producing the part table) |
+| Prompt template | Item — "a pretty fruit platter" |
+| Inpainting model | `gpt-image-2` (sync protocol, can send local images with a mask) |
+| Pixel segmentation | MobileSAM, ~40 MB weights |
+| Mesh density | 8 (grid subdivision per part) |
+| Inpaint rounds | 2 max per part |
+| Output dir | `./output/generated` |
+| Export target | `cocos-3.8` (skeleton 3.8.75, rotation keys use `angle`) |
+| Result | 7 parts → 5 weighted meshes + 2 regions; atlas 1024×436 |
+| Animation | `idle` only |
+
+> `gpt-image-2` is a **gateway-side model code**, not something this project pins to. Switch
+> providers and you re-pick it and its whitelist in the UI; `config/api-defaults.json` holds only
+> the endpoint address.
+
 ---
 
 ## Output layout
