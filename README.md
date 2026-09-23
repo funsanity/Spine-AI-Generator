@@ -144,7 +144,7 @@
 |---|---|---|
 | AI 分析部件 | **必需**：一个视觉模型 API Key | 工具无法工作 |
 | 切图 / 拼装 / 骨架 / 导出 | **必需**：Node 20+ | 工具无法工作 |
-| 像素级分割 | 可选：MobileSAM（约 800MB） | 回退到多边形蒙版，边界略糙但能用 |
+| 像素级分割 | 可选：MobileSAM（约 800MB）或 SAM 3（约 4GB） | 回退到多边形蒙版，边界略糙但能用 |
 | 遮挡补图 | 可选：一个图像生成模型 | 被压住的区域留透明，部件单独看有洞 |
 | `.spine` 源工程 | 可选：本机装了 Spine 4.x 编辑器 | 目标平台资源照常产出，只是没有可二次编辑的工程 |
 
@@ -178,9 +178,33 @@ npm run web
 # 像素级分割：自动建虚拟环境 + 拉模型权重（约 800MB，一次性）
 npm run sam:setup && npm run sam:check
 
+# 或者换成 SAM 3（约 4GB，需要 Python 3.10+）：
+#   npm run sam3:setup && npm run sam3:check
+#   然后在 .env 里设 SPINE_SEGMENTER=sam3
+
 # .spine 源工程：装好 Spine 4.x 编辑器即可，会自动找常见安装位置
 # 装在别处就设 SPINE_CLI_PATH
 ```
+
+**两个分割器怎么选**：
+
+| | MobileSAM（默认） | SAM 3 |
+|---|---|---|
+| 提示方式 | 框（bbox） | 文本（部件名） |
+| 速度 | 每部件 10~25ms | 每部件约 4.5s |
+| 环境大小 | 585MB | 4GB（含 3.4GB 权重） |
+| Python | 3.9 | 3.10+ |
+| 擅长 | 大块部件 | 细碎部件（眼镜、眼睛、耳环） |
+
+MobileSAM 只吃框，而框里几乎总装着好几件东西，它只挑最显眼的那件——实测
+眼镜的框里它挑中整张脸。SAM 3 用文本提示绕开这个问题，给 `glasses` 就是眼镜。
+
+所以**换 sam3 是为了治具体的病，不是普遍升级**：默认保持 mobilesam，只在
+细碎部件被切错时切过去。两台环境互不影响，可以都装、随时切。
+
+> SAM 3 权重是 **SAM License**（不是本项目的 Apache-2.0），官方仓库在
+> HuggingFace 上是需要审批的 gated 仓库。安装脚本只从 ModelScope 镜像拉到
+> 你自己机器上、不随仓库分发，用之前请自行确认许可条款。
 
 ---
 
@@ -324,6 +348,8 @@ output/<工程名>/
 | `OUTPUT_DIR` | `./output` | 产物根目录 |
 | `SPINE_CLI_PATH` | 自动查找 | Spine 编辑器可执行文件 |
 | `SPINE_SAM_HOME` | `~/.spine-tool/mobilesam` | MobileSAM 环境位置 |
+| `SPINE_SAM3_HOME` | `~/.spine-tool/sam3` | SAM 3 环境位置 |
+| `SPINE_SEGMENTER` | `mobilesam` | 用哪个分割器：`mobilesam` / `sam3` |
 
 **换 API 接入点**：改 `config/api-defaults.json` 一处即可——界面表单的默认值从那里取，
 不用在代码里翻找。`.env` 里的设置优先级更高，只影响本机。
@@ -386,6 +412,8 @@ npm run verify           # 校验产物结构
 npm run shot             # 截预览图
 npm run check            # 环境自检
 npm run sam:check        # MobileSAM 环境状态
+npm run sam3:setup       # 装 SAM 3（约 4GB）
+npm run sam3:check       # SAM 3 环境状态
 ```
 
 ### 代码结构
