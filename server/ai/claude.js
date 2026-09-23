@@ -257,8 +257,25 @@ export function isTransient(err) {
   if (status === 429) return true;
   if (status >= 500 && status < 600) return true;
   if (status === 400) {
+    /*
+     * 只认 `invalid_request_error` 这个 **type**，不看 message 的措辞。
+     *
+     * 原来的判据是 /invalid request/i 匹配 message。中转站换过文案之后就漏了：
+     * 老的是 "Invalid request"，新的是 "The request could not be processed.
+     * Please check the request parameters." —— 两句话里都没有 "invalid request"
+     * 这个短语，于是本该重试的瞬时抖动被当成永久失败，一次抖动整轮白跑。
+     *
+     * type 字段比 message 稳：它来自协议约定，网关改措辞不会动它。
+     *
+     * 但 type 有时拿不到 —— 调用方把错误包成 `AI 分析失败: ${err.message}`
+     * 重抛之后原始字段就丢了。所以再加一条按 type 名匹配 message 的兜底。
+     */
+    const type = err?.error?.error?.type || err?.error?.type || err?.type;
+    if (type === 'invalid_request_error') return true;
     const msg = err?.message || '';
-    return /invalid request/i.test(msg);
+    // 下划线和空格两种写法都要认：协议里是 invalid_request_error，
+    // 但网关的散文里写的是 "Invalid request"（老文案就是这句）
+    return /invalid[ _]request/i.test(msg);
   }
   // 连接层抖动：DNS、TLS、socket 被掐
   const code = err?.code || err?.cause?.code || '';

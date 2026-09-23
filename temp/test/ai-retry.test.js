@@ -25,8 +25,40 @@ describe('isTransient: 哪些错误值得重试', () => {
     assert.equal(isTransient(err(400, '400 {"type":"error","error":{"type":"invalid_request_error","message":"Invalid request"}}')), true);
   });
 
+  /*
+   * 下面这条是实际踩出来的回归。
+   *
+   * 中转站换过文案：老的是 "Invalid request"，新的变成 "The request could
+   * not be processed. Please check the request parameters."。而判据原来是
+   * 匹配 message 里的 "invalid request" 这个**短语**，新文案里没有它，
+   * 于是本该重试的瞬时抖动被判成永久失败 —— 一次抖动整轮生成白跑，
+   * 而且重试日志一条都没有，看起来像"重试逻辑压根没实现"。
+   *
+   * 判据改成认 `invalid_request_error` 这个 type 之后，两种措辞都能识别。
+   */
+  it('中转站换了文案的 400 → 仍然重试（判据认 type 不认措辞）', () => {
+    const real = 'AI 分析失败: 400 {"type":"error","error":{"type":"invalid_request_error",'
+      + '"message":"The request could not be processed. Please check the request parameters."},'
+      + '"request_id":"task_df93952a416c419aa2ce2440f6300e81"}';
+    assert.equal(isTransient(err(400, real)), true);
+  });
+
+  it('原始错误对象带 type 时，直接看 type（message 被包装过也不影响）', () => {
+    // 调用方会把错误包成 `AI 分析失败: ${err.message}` 重抛，原始字段就丢了；
+    // 没丢的时候应当优先信 type
+    const e = err(400, '包装过的文案，看不出所以然');
+    e.error = { error: { type: 'invalid_request_error' } };
+    assert.equal(isTransient(e), true);
+  });
+
   it('模型名不存在的 400 → 不重试（重试多少次都一样）', () => {
     assert.equal(isTransient(err(400, 'No active provider route for TEXT/claude-opus-5[1M] with mode SYNC')), false);
+  });
+
+  it('请求体真的非法的 400 → 不重试', () => {
+    // 收紧判据不能把这一类也放进去：它们重试多少次都是同样的错
+    assert.equal(isTransient(err(400, 'max_tokens: must be <= 32000')), false);
+    assert.equal(isTransient(err(400, 'messages: at least one message is required')), false);
   });
 
   it('401/403 鉴权失败 → 不重试', () => {
