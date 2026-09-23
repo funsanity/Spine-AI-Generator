@@ -12,6 +12,7 @@
  */
 
 import { getSamClient } from './client.mjs';
+import { getSam3Client } from './client-sam3.mjs';
 
 /**
  * @param {string} imagePath - 源图路径
@@ -28,19 +29,80 @@ import { getSamClient } from './client.mjs';
  */
 const MIN_COVERAGE = 0.15;
 
+/**
+ * 选哪个分割器。
+ *
+ *   mobilesam（默认）—— 框提示。快（每部件 10~25ms）、环境小（585MB），
+ *                        但框里装了两件东西时会挑错：实测眼镜切成整张脸。
+ *   sam3            —— 文本提示。慢（每部件约 4.5s）、环境大（4GB），
+ *                        但不需要框，眼镜就是眼镜、眼睛就是眼睛。
+ *
+ * 默认仍是 mobilesam：它是现役路径，且绝大多数图跑得好好的。
+ * 换 sam3 是**为了治具体的病**（细碎部件、框里有重物），不是普遍升级。
+ *
+ * 用 opts.segmenter 或环境变量 SPINE_SEGMENTER 切换。
+ */
+function resolveSegmenter(opts) {
+  const v = opts.segmenter || process.env.SPINE_SEGMENTER || 'mobilesam';
+  return String(v).trim().toLowerCase() === 'sam3' ? 'sam3' : 'mobilesam';
+}
+
+/* SAM 3 这条路**完全不设覆盖率门槛**，连很低的兜底下限都不要。
+ *
+ * 这个决定是踩了坑才定的：原本留了个 1% 的下限"兜住掩码塌成几个像素的情况"，
+ * 结果它把**正确的**眼镜掩码杀掉了 —— 覆盖率 0.9%，刚好卡在门槛之下。
+ * 眼镜本来就只占整张画布约 0.5%，它小不是因为切错了，而是因为它就是小。
+ *
+ * 更根本的问题是：没有 bbox 时覆盖率的分母会退化成整张图的不透明像素，
+ * 而那些像素大部分属于身体的其它部位。这个数字衡量的是"掩码占整幅画的比例"，
+ * 跟切得准不准无关。拿它当判据，越小的部件越容易被误杀 —— 而"细碎部件"
+ * 恰恰是换到 SAM 3 的理由，门槛和目的是反的。
+ *
+ * 真正管用的两道闸在别处，而且都实测校准过：
+ *   · worker 侧的得分门槛（0.5）—— 低于它根本不返回结果
+ *   · presence_logits —— 模型自己判断"图上有没有这件东西"，判否的部件
+ *     在客户端就被挡掉了（实测"backpack" presence=-4.41，正确识别为没有）
+ *
+ * 这两道闸之外再按面积加判断是多余的：post_process 走的是逐实例置信度，
+ * 塌成几个像素的掩码压根到不了这一步。
+ */
+
 export async function segmentParts(imagePath, parts, opts = {}) {
   const { useSam = true, onLog = () => {}, requireEnv = false } = opts;
 
   if (!useSam) return null;
 
-  const usable = (parts || []).filter(
-    (p) => p && p.name && p.bbox && typeof p.bbox.x === 'number'
+  const segmenter = resolveSegmenter(opts);
+
+  /*
+   * 可用的部件。
+   *
+   * 两边对 bbox 的依赖不同：
+   *   MobileSAM 必须有 bbox —— 框就是它的提示词，没有框它无从下手
+   *   SAM 3    bbox 可有可无 —— 提示词是部件名，框只在多实例时用来选哪一个
+   * 所以 sam3 分支只要求有 name。
+   */
+  const usable = (parts || []).filter((p) =>
+    p && p.name && (segmenter === 'sam3' || (p.bbox && typeof p.bbox.x === 'number'))
   );
   if (!usable.length) {
-    onLog('没有可分割的部件（都缺 bbox）', 'info');
+    onLog(
+      segmenter === 'sam3'
+        ? '没有可分割的部件（都缺 name）'
+        : '没有可分割的部件（都缺 bbox）',
+      'info'
+    );
     return null;
   }
 
+  if (segmenter === 'sam3') {
+    return segmentWithSam3(imagePath, usable, { onLog, requireEnv });
+  }
+  return segmentWithMobileSam(imagePath, usable, { onLog, requireEnv });
+}
+
+/** MobileSAM 路径：框提示，保持原有行为一字不动 */
+async function segmentWithMobileSam(imagePath, usable, { onLog, requireEnv }) {
   const sam = getSamClient({ onLog });
 
   if (!sam.checkEnv()) {
@@ -113,6 +175,75 @@ export async function segmentParts(imagePath, parts, opts = {}) {
     return masks;
   } catch (e) {
     // 任何失败都不该中断生成：环境问题、worker 崩溃、超时，一律退化
+    onLog(`⚠ 分割失败，退回多边形轮廓：${e.message}`, 'info');
+    return null;
+  }
+}
+
+/**
+ * SAM 3 路径：文本提示。
+ *
+ * 与 MobileSAM 路径的四处关键差异：
+ *
+ *   1. **不需要框**。提示词就是部件名，所以 AI 给的 bbox 再糙也不影响结果。
+ *      这治的是 MobileSAM 那个治不好的病：框里装了两件东西时它必然挑错。
+ *
+ *   2. **「模型判定图上没有这件东西」不是失败**。presence_logits 判否的部件
+ *      在客户端就被挡掉了（根本不进返回的 Map），于是它们自然走
+ *      「没掩码 → 退回多边形」那条正常路径。实测一个不存在的部件
+ *      （"backpack"）被正确识别为没有，presence=-4.41。
+ *
+ *   3. **慢，慢两个数量级**。实测每提示词约 4.5s，8 个部件约 90s。
+ *      所以日志里的措辞要让人有心理准备，不能照抄 MobileSAM 的"正在做…"。
+ *
+ *   4. **不做覆盖率筛选**。理由见文件上方那段注释 —— 那个指标在文本提示
+ *      这条路上是纯粹的误伤源，连很低的兜底下限都会杀掉正确的小部件。
+ */
+async function segmentWithSam3(imagePath, usable, { onLog, requireEnv }) {
+  const sam = getSam3Client({ onLog });
+
+  if (!sam.checkEnv()) {
+    if (requireEnv) {
+      throw new Error('SAM 3 环境未安装');
+    }
+    onLog(
+      '未安装 SAM 3，用 AI 多边形轮廓切图。想装的话运行：node server/sam/setup-sam3.mjs（4GB）',
+      'info'
+    );
+    return null;
+  }
+
+  onLog(`正在做像素级部件分割（SAM 3 文本提示，${usable.length} 个部件，约 ${Math.round(usable.length * 4.5)}s）...`, 'progress');
+  try {
+    const t0 = Date.now();
+    const masks = await sam.segment(imagePath, usable);
+    const ms = Date.now() - t0;
+
+    if (!masks.size) {
+      onLog('⚠ 分割没有产出任何掩码，退回多边形轮廓', 'info');
+      return null;
+    }
+
+    // 这里**刻意不做筛选**：能进到这个 Map 的掩码都已经过 worker 的
+    // 得分门槛（0.5）和 presence 判定，再筛只会误伤小部件。
+    // 理由见文件上方关于覆盖率门槛的说明。
+
+    const avgScore = [...masks.values()].reduce((s, m) => s + m.score, 0) / masks.size;
+    onLog(
+      `✓ 分割完成（SAM 3）：${masks.size}/${usable.length} 个部件，` +
+      `耗时 ${(ms / 1000).toFixed(1)}s，平均置信度 ${avgScore.toFixed(2)}`,
+      'success'
+    );
+
+    if (masks.size < usable.length) {
+      const missing = usable
+        .filter((p) => !masks.has(p.name))
+        .map((p) => p.name).join(', ');
+      onLog(`⚠ 这几个部件没切出掩码，将退回多边形轮廓：${missing}`, 'info');
+    }
+
+    return masks;
+  } catch (e) {
     onLog(`⚠ 分割失败，退回多边形轮廓：${e.message}`, 'info');
     return null;
   }

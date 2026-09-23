@@ -1028,18 +1028,35 @@ async function syncSamStatus() {
   try {
     const res = await fetch('/api/sam-status');
     const st = await res.json();
+
+    /*
+     * 两个分割器的耗时差两个数量级，提示语不能共用一套。
+     * 拿 MobileSAM 的"每张约 0.3 秒"去描述 SAM 3（实测每部件约 4.5 秒、
+     * 8 个部件约 90 秒）会让人以为卡死了，反过来则白劝退。
+     */
+    const sam3 = st.segmenter === 'sam3';
+    const label = sam3 ? 'SAM 3' : 'MobileSAM';
+    const cost = sam3
+      ? '每个部件约 4~5 秒，8 个部件约 90 秒'
+      : '首次调用约 2 秒，之后每张图约 0.3 秒';
+
+    // 标签跟着实际用的分割器走。写死成 MobileSAM 的话，切到 SAM 3 之后
+    // 界面上写着 MobileSAM、实际跑的是 SAM 3，排查问题时最容易被这条误导。
+    const nameEl = document.getElementById('samLabel');
+    if (nameEl) nameEl.textContent = label;
+
     if (st.ok) {
       toggle.disabled = false;
       hint.textContent = st.running
-        ? '分割模型已在运行，切图轮廓精确到像素级'
-        : '用分割模型把每个部件的轮廓描到像素级，切图里不再混进邻件。纯本地计算，首次调用约 2 秒，之后每张图约 0.3 秒';
+        ? `${label} 已在运行，切图轮廓精确到像素级`
+        : `用 ${label} 把每个部件的轮廓描到像素级，切图里不再混进邻件。纯本地计算，${cost}`;
       hint.style.color = '';
       return;
     }
     // 没装：取消勾选并说明怎么装
     toggle.checked = false;
     toggle.disabled = false;
-    hint.textContent = '未安装分割模型，当前用 AI 多边形轮廓切图（较粗）。安装后切图轮廓精确到像素级：'
+    hint.textContent = `未安装 ${label}，当前用 AI 多边形轮廓切图（较粗）。安装后切图轮廓精确到像素级：`
       + (st.setupCommand || 'node server/sam/setup.mjs');
     hint.style.color = 'var(--warning, #b8860b)';
   } catch {

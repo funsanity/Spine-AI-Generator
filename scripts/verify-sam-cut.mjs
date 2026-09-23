@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const SOURCE = join(ROOT, 'test_assets/level_83/hidden/12.png');
+const SOURCE = join(ROOT, 'test_assets/12.png');
 const ANALYSIS = join(ROOT, 'output/_polygons/analysis.json');
 const OUT = join(ROOT, 'output/_sam_verify');
 

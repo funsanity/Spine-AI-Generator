@@ -22,6 +22,8 @@
     "web": "node server/index.js",
     "sam:setup": "node server/sam/setup.mjs",
     "sam:check": "node server/sam/setup.mjs --check",
+    "sam3:setup": "node server/sam/setup-sam3.mjs",
+    "sam3:check": "node server/sam/setup-sam3.mjs --check",
     "verify:sam": "node scripts/verify-sam-cut.mjs"
   },
   "dependencies": {

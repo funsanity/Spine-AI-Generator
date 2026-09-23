@@ -26,6 +26,7 @@ import {
 } from './api/workspace.js';
 import { writeEnv, readEnv, presenceOf, ENV_PATH } from './api/env-file.js';
 import { getSamClient, stopSamClient, check as checkSamEnv } from './sam/client.mjs';
+import { getSam3Client, checkSam3 as checkSam3Env } from './sam/client-sam3.mjs';
 import { segmentParts } from './sam/segment.mjs';
 import { execFile, spawn } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
@@ -359,14 +360,41 @@ app.post('/api/restart', (req, res) => {
  */
 app.get('/api/sam-status', async (req, res) => {
   try {
+    // 当前选的是哪个分割器。默认 mobilesam，用 SPINE_SEGMENTER=sam3 切过去。
+    const segmenter = String(process.env.SPINE_SEGMENTER || 'mobilesam').trim().toLowerCase() === 'sam3'
+      ? 'sam3' : 'mobilesam';
+
+    if (segmenter === 'sam3') {
+      const st = await checkSam3Env();
+      const client = getSam3Client();
+      return res.json({
+        segmenter,
+        ...st,
+        running: !!(client.proc && client.ready),
+        stats: client.stats,
+        lastError: client.lastError,
+        setupCommand: 'node server/sam/setup-sam3.mjs',
+        // 两个环境各自的就绪状态都报，用户想切换时不用自己去翻目录
+        alternates: {
+          mobilesam: await checkSamEnv().then((s) => s.ok).catch(() => false),
+          sam3: st.ok
+        }
+      });
+    }
+
     const st = await checkSamEnv();
     const client = getSamClient();
     res.json({
+      segmenter,
       ...st,
       running: !!(client.proc && client.ready),
       stats: client.stats,
       lastError: client.lastError,
-      setupCommand: 'node server/sam/setup.mjs'
+      setupCommand: 'node server/sam/setup.mjs',
+      alternates: {
+        mobilesam: st.ok,
+        sam3: await checkSam3Env().then((s) => s.ok).catch(() => false)
+      }
     });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -684,9 +712,14 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     const imagesDir = workspace.imagesDir;
 
     // 分割失败不中断生成，内部已兜底，返回值可能是 null
+    //
+    // segmenter 可以由本次请求指定（界面上切），没给就走 .env 里的
+    // SPINE_SEGMENTER，再没有就用默认的 mobilesam。做成按次生效是为了
+    // 能同一条 UI 路径切着对比，而不用改 .env 再重启服务。
     const samMasks = await segmentParts(imagePath, analysis.parts, {
       useSam,
-      onLog: broadcastLog
+      onLog: broadcastLog,
+      segmenter: req.body.segmenter
     });
 
     const cutResults = await cutImageParts(imagePath, analysis.parts, imagesDir,
