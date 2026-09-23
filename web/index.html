@@ -176,15 +176,29 @@
             </div>
 
             <!--
-              MobileSAM 像素级部件分割。AI 给的 bbox 只说明"东西大概在这块"，
-              真正把它变成逐像素轮廓的是这个模型。有了它，西红柿切图里不再
-              有篮圈和提手——被挡住的地方留成透明，正好交给补图。
+              像素级部件分割。AI 给的 bbox 只说明"东西大概在这块"，真正把它
+              变成逐像素轮廓的是这个模型。有了它，西红柿切图里不再有篮圈和
+              提手——被挡住的地方留成透明，正好交给补图。
               环境没装时自动退回多边形轮廓，不影响生成。
+
+              两个分割器是对等的可选项，不是新旧版本，所以用单选：
+              MobileSAM 吃 bbox，快两个数量级，大块部件够用；
+              SAM 3 吃文本提示，慢，但框里装了两件东西时不会挑错（实测眼镜
+              的框里 MobileSAM 会挑中整张脸）。按图切着用。
+              环境没装的那个由 app.js 置灰并附上安装命令。
             -->
             <div class="form-group span-2">
               <label class="toggle">
-                <input type="checkbox" id="samToggle" checked> <span id="samLabel">MobileSAM</span>
+                <input type="checkbox" id="samToggle" checked> 启用像素级分割
               </label>
+              <div class="seg-row" id="segRow">
+                <label class="toggle">
+                  <input type="radio" name="segmenter" id="segMobile" value="mobilesam" checked><span>MobileSAM</span>
+                </label>
+                <label class="toggle">
+                  <input type="radio" name="segmenter" id="segSam3" value="sam3"><span>SAM 3</span>
+                </label>
+              </div>
               <p class="hint" id="samHint">
                 用分割模型把每个部件的轮廓描到像素级，切图里不再混进邻件。纯本地计算，实测每张图约 0.3 秒
               </p>

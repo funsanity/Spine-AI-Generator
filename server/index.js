@@ -7,7 +7,7 @@
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import { join, dirname, relative, isAbsolute, resolve, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { analyzeImage, classifyImage, DEFAULT_MODEL, REASONING_LEVELS } from './ai/claude.js';
@@ -25,13 +25,30 @@ import {
   sourceDirOf, tempDirOf, imagesDirOf, resolveSourceName, targetDirOf
 } from './api/workspace.js';
 import { writeEnv, readEnv, presenceOf, ENV_PATH } from './api/env-file.js';
-import { getSamClient, stopSamClient, check as checkSamEnv } from './sam/client.mjs';
-import { getSam3Client, checkSam3 as checkSam3Env } from './sam/client-sam3.mjs';
+// 注意用的是 client 的 checkEnv 而不是 setup 的 check：
+// 后者会 spawn 一个 python 子进程去 `import torch` 验证依赖，实测 2.8 秒
+// （SAM 3 那边 5.2 秒）。这个接口每次页面加载都要调，扛不住。
+// checkEnv 只查文件在不在，微秒级；真要验依赖由 `npm run sam:check` 负责。
+import { getSamClient, stopSamClient, paths } from './sam/client.mjs';
+import { getSam3Client, stopSam3Client, sam3Paths } from './sam/client-sam3.mjs';
 import { segmentParts } from './sam/segment.mjs';
 import { execFile, spawn } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { stat, writeFile } from 'fs/promises';
 import { promisify } from 'util';
+
+/*
+ * .env 的加载路径必须和 ENV_PATH（env-file.js 里那个写入目标）一致。
+ *
+ * 原来这里是 `import 'dotenv/config'`，它固定读仓库根的 .env，不看
+ * SPINE_ENV_PATH。于是 SPINE_ENV_PATH 只影响"写到哪"，不影响"读哪" ——
+ * 两者不一致时会出现很别扭的状况：切换分割器写进了 A 文件、进程读的
+ * 还是 B 文件，界面显示的和实际生效的悄悄对不上。测试想隔离到临时文件
+ * 也做不到。
+ *
+ * 放这儿是因为要在 ENV_PATH 被解析之前读——它是从环境变量算出来的。
+ */
+dotenv.config({ path: process.env.SPINE_ENV_PATH || join(dirname(fileURLToPath(import.meta.url)), '../.env') });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -67,6 +84,25 @@ const templatesPathNow = () => (existsSync(PROMPT_TEMPLATES_PATH)
 
 // 存储活跃的 SSE 连接
 const logClients = new Set();
+
+/**
+ * 生成是否正在进行。
+ *
+ * 为什么需要这个：切换分割器要关掉旧 worker，而生成正跑到一半时关掉它
+ * 会让本次分割中途失败——不崩，会退回多边形轮廓，但用户拿到的东西和他
+ * 点的那个分割器对不上，而且没有任何提示。这种"看着成功其实降级了"的
+ * 结果最难查，不如直接拦住不让切。
+ *
+ * /api/generate 里用 try/finally 维护它：那个路由有好几个提前 return，
+ * 只有 finally 能保证一定置回来。
+ */
+let generating = false;
+
+/** 两个分割器各自的安装命令，切换失败时告诉用户怎么办 */
+const SEGMENTER_SETUP = {
+  mobilesam: 'node server/sam/setup.mjs',
+  sam3: 'node server/sam/setup-sam3.mjs'
+};
 
 /** 本进程的启动时刻。/api/health 带出去，前端用来认「是不是同一个进程」 */
 const STARTED_AT = Date.now();
@@ -336,8 +372,21 @@ app.post('/api/restart', (req, res) => {
     }
     console.log(`[重启] 已拉起新进程 PID=${child.pid}，本进程 ${process.pid} 退出`);
 
-    // SAM worker 是本进程的子进程，不显式关掉会变成孤儿还占着 585MB
+    /*
+     * 两个 SAM worker 都要主动关。
+     *
+     * 原来只关了 MobileSAM —— 在只有它的时候这是对的，加了 SAM 3 之后就漏了。
+     *
+     * 实测这个漏掉的后果没有想象中严重：worker 的 stdin 读循环会因为管道
+     * 写端关闭而读到 EOF，stdout 下次写还会收到 SIGPIPE，所以父进程一消失
+     * 它通常也会跟着退（SIGKILL 父进程也一样）。
+     *
+     * 但"通常"不等于"确定"，而且不主动关的时候回收时机是滞后的。这里显式
+     * 关掉，退出路径才是确定的、立刻的 —— 那个 worker 占着约 1.9GB 显存
+     * + 3.4GB 内存，不值得赌它自己会不会走。
+     */
     try { stopSamClient(); } catch { /* 没起来过就没得关 */ }
+    try { stopSam3Client(); } catch { /* 同上 */ }
 
     // SSE 是长连接，不主动断开 server.close() 永远等不到回调
     for (const c of logClients) { try { c.end(); } catch { /* 已经断了 */ } }
@@ -350,54 +399,168 @@ app.post('/api/restart', (req, res) => {
 });
 
 /**
- * MobileSAM 分割环境的状态。
+ * 两个分割器各自"装没装"，纯文件检查，不 spawn 任何进程。
  *
- * 前端用它决定要不要显示「开启像素级分割」这个选项，
- * 以及没装的时候提示用户去装。
+ * 这是这个接口里唯一还要花钱的地方，所以必须便宜：实测 setup 那两个
+ * check 要 spawn python 去 import torch（MobileSAM 2.8s、SAM 3 5.2s），
+ * 而这里每次页面加载都会被调。代价是它只验文件在不在，验不了依赖是否
+ * 真能 import —— 那个由 `npm run sam:check` / `sam3:check` 负责，
+ * 是用户主动发起的、慢一点无所谓。
+ */
+function segmentersAvailable() {
+  const has = (client) => {
+    try { return client().checkEnv() === true; } catch { return false; }
+  };
+  return { mobilesam: has(getSamClient), sam3: has(getSam3Client) };
+}
+
+/**
+ * 某个分割器的环境明细。
+ *
+ * 刻意**不查依赖能不能 import**：那要 spawn 一个 python 子进程（实测
+ * MobileSAM 2.8 秒、SAM 3 5.2 秒），而这个接口每次页面加载都调。
+ * deps 一律报 true，意思是"没查出问题"——真要验依赖用
+ * `npm run sam:check` / `sam3:check`，那是用户主动发起的，慢一点无所谓。
+ */
+function segmenterDetail(seg) {
+  const sam3 = seg === 'sam3';
+  const cl = sam3 ? getSam3Client() : getSamClient();
+  // 路径一律来自各自的 paths()，别在这儿手拼目录名——
+  // 拼错了会静默报"没装"，比报错更难查
+  const p = sam3
+    ? { ...sam3Paths(), repo: null }
+    : paths();
+  return {
+    home: p.home,
+    venv: existsSync(p.python),
+    repo: sam3 ? true : existsSync(join(p.repo, 'mobile_sam', '__init__.py')),
+    weights: existsSync(p.weights),
+    deps: true,
+    ok: cl.checkEnv()
+  };
+}
+
+/**
+ * 当前选的是哪个分割器。
+ *
+ * 读 process.env 而不是建个模块级变量存着：切换接口会直接改
+ * process.env.SPINE_SEGMENTER，而 segment.mjs 的 resolveSegmenter 也是
+ * 每次调用时读环境变量。三处读同一个来源，就没有"内存里一份、环境里
+ * 一份、文件里一份"那种对不上的可能。
+ */
+function currentSegmenter() {
+  return String(process.env.SPINE_SEGMENTER || 'mobilesam').trim().toLowerCase() === 'sam3'
+    ? 'sam3' : 'mobilesam';
+}
+
+/**
+ * 分割环境的状态。
+ *
+ * 前端用它决定：分割开关能不能勾、两个分割器哪个可选、以及没装的那个
+ * 怎么提示用户去装。
  *
  * 只查文件是否存在，不 import torch —— 后者要一秒多，
  * 不该压在每次页面加载的路径上。
  */
-app.get('/api/sam-status', async (req, res) => {
+app.get('/api/sam-status', (req, res) => {
   try {
-    // 当前选的是哪个分割器。默认 mobilesam，用 SPINE_SEGMENTER=sam3 切过去。
-    const segmenter = String(process.env.SPINE_SEGMENTER || 'mobilesam').trim().toLowerCase() === 'sam3'
-      ? 'sam3' : 'mobilesam';
+    const segmenter = currentSegmenter();
+    const sam3 = segmenter === 'sam3';
+    const client = sam3 ? getSam3Client() : getSamClient();
+    const alternates = segmentersAvailable();
 
-    if (segmenter === 'sam3') {
-      const st = await checkSam3Env();
-      const client = getSam3Client();
-      return res.json({
-        segmenter,
-        ...st,
-        running: !!(client.proc && client.ready),
-        stats: client.stats,
-        lastError: client.lastError,
-        setupCommand: 'node server/sam/setup-sam3.mjs',
-        // 两个环境各自的就绪状态都报，用户想切换时不用自己去翻目录
-        alternates: {
-          mobilesam: await checkSamEnv().then((s) => s.ok).catch(() => false),
-          sam3: st.ok
-        }
-      });
-    }
-
-    const st = await checkSamEnv();
-    const client = getSamClient();
     res.json({
       segmenter,
-      ...st,
+      ...segmenterDetail(segmenter),
       running: !!(client.proc && client.ready),
       stats: client.stats,
       lastError: client.lastError,
-      setupCommand: 'node server/sam/setup.mjs',
-      alternates: {
-        mobilesam: st.ok,
-        sam3: await checkSam3Env().then((s) => s.ok).catch(() => false)
-      }
+      setupCommand: SEGMENTER_SETUP[segmenter],
+      // 生成进行中时前端要禁用切换控件，理由见 generating 的注释
+      generating,
+      // 两个环境各自的就绪状态：前端用它决定哪个 radio 可选、哪个置灰。
+      // 只报当前那个不够——用户想切换时正需要知道另一个装没装。
+      alternates
     });
   } catch (e) {
     res.json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * 切换分割器。
+ *
+ * 立刻生效，不需要重启服务：写进 .env 让下次启动还记得，同时改
+ * process.env 让当前进程马上用新的（resolveSegmenter 每次调用都读它）。
+ *
+ * 切完把旧的 worker 关掉——两个都留着的话 SAM 3 那 1.9GB 显存 + 3.4GB
+ * 内存会一直占着，而它重新加载只要约 10 秒，比一直占着划算。
+ */
+app.post('/api/segmenter', async (req, res) => {
+  const value = String(req.body?.segmenter ?? '').trim().toLowerCase();
+
+  // 只认这两个值。不静默退回默认值：resolveSegmenter 那边不认识的拼写会
+  // 退回 mobilesam，但接口层再吞一次拼写错误，用户就会以为切成功了。
+  if (value !== 'mobilesam' && value !== 'sam3') {
+    return res.status(400).json({
+      success: false,
+      error: `不认识的分割器：${req.body?.segmenter}。只支持 mobilesam 和 sam3`
+    });
+  }
+
+  if (generating) {
+    return res.status(409).json({
+      success: false,
+      error: '正在生成，请等本次完成后再切换分割器'
+    });
+  }
+
+  // 目标环境没装就拒绝。前端会把那个选项置灰，但置灰只是 UI——
+  // 直接 curl 一样能打进来，所以这里必须自己兜底。
+  const installed = segmentersAvailable()[value];
+  if (!installed) {
+    return res.status(400).json({
+      success: false,
+      error: `没装 ${value === 'sam3' ? 'SAM 3' : 'MobileSAM'} 环境，先运行：${SEGMENTER_SETUP[value]}`
+    });
+  }
+
+  const previous = currentSegmenter();
+  if (previous === value) {
+    return res.json({ success: true, segmenter: value, changed: [], unchanged: true });
+  }
+
+  // 内存先行：这一步成功，本次运行就已经切过去了，后面写文件失败也只是
+  // "下次启动不记得"，不影响现在能用。
+  process.env.SPINE_SEGMENTER = value;
+
+  // 关掉旧的那个。两个 stop 都是"存在才关"，重复调安全。
+  try {
+    if (value === 'sam3') stopSamClient();
+    else stopSam3Client();
+  } catch (e) {
+    broadcastLog(`⚠ 关闭旧分割器 worker 失败（不影响本次切换）：${e.message}`, 'info');
+  }
+
+  try {
+    const result = await writeEnv({ SPINE_SEGMENTER: value });
+    if (result.changed.length) {
+      broadcastLog(`✓ 已切换分割器：${previous} → ${value}，并写入 .env`, 'success');
+    } else {
+      broadcastLog(`✓ 已切换分割器：${previous} → ${value}（.env 内容无变化）`, 'success');
+    }
+    res.json({ success: true, segmenter: value, previous, changed: result.changed, path: result.path });
+  } catch (e) {
+    // 双错分支，照抄 /api/save-api-config 的做法：内存里切好了、本次能用，
+    // 只是没记住。这种情况报错会让用户以为切换失败了，其实没有。
+    broadcastLog(`⚠ 已切换分割器：${previous} → ${value}，但写入 .env 失败：${e.message}`, 'warning');
+    res.json({
+      success: true,
+      segmenter: value,
+      previous,
+      changed: [],
+      envError: e.message
+    });
   }
 });
 
@@ -522,6 +685,9 @@ function num(value, fallback, { min = 0, max = Infinity } = {}) {
 
 // 主流程：图片 → AI 分析 → 切图 → 生成骨骼+动画
 app.post('/api/generate', upload.single('image'), async (req, res) => {
+  // 占住"正在生成"这个位。切换分割器要关掉 worker，生成中途关掉会让本次
+  // 分割静默降级成多边形轮廓，所以生成期间不允许切（见 /api/segmenter）。
+  generating = true;
   try {
     // 前端没填 API 配置时，回退到环境变量 / .env，省得每次都手输
     const prompt = req.body.prompt;
@@ -899,6 +1065,11 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
       success: false,
       error: error.message
     });
+  } finally {
+    // 必须放 finally：这个路由中间有好几个提前 return（参数校验失败、
+    // 没有图片、AI 分析失败…），写在函数末尾会漏掉它们，
+    // 结果是"生成过一次失败之后就再也切不了分割器"。
+    generating = false;
   }
 });
 

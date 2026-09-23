@@ -557,6 +557,17 @@ const TRACKED_INPUTS = [
 // 复选框的状态在 .checked 上，不在 .value 上，得分开存取
 const TRACKED_TOGGLES = ['cleanToggle', 'inpaintToggle', 'tightCutToggle', 'snapToggle', 'backgroundToggle', 'samToggle'];
 
+/*
+ * 分割器单选组的存储键。
+ *
+ * 不能塞进 TRACKED_TOGGLES：一组 radio 里没被选中的那些 .checked 也是 false，
+ * 逐元素回填会互相打（最后遍历到的那个赢，而不是用户真正选的那个）。
+ * 也不能塞进 TRACKED_INPUTS：那边是逐元素赋 .value，而 radio 的选中态在
+ * .checked 上，赋 value 改不了选中态。
+ * 所以单独一个键，回填时按组处理（见 restoreInputs）。
+ */
+const SEGMENTER_KEY = 'segmenter';
+
 function persistInputs() {
   const inputs = {};
   for (const id of TRACKED_INPUTS) {
@@ -567,6 +578,8 @@ function persistInputs() {
     const el = document.getElementById(id);
     if (el) inputs[id] = el.checked;
   }
+  const seg = checkedSegmenter();
+  if (seg) inputs[SEGMENTER_KEY] = seg;
   saveInputs(inputs);
 }
 
@@ -584,6 +597,9 @@ function restoreInputs() {
     // 这里要判 typeof：false 是有效状态，用真值判断会把"用户关掉了"当成没存过
     if (el && typeof saved[id] === 'boolean') el.checked = saved[id];
   }
+  // radio 组按值回填。这里只是让界面先按上次的选择显示，真正的权威是
+  // 服务端的 .env —— syncSamStatus() 拿到响应后会用实际值覆盖它。
+  if (saved[SEGMENTER_KEY]) setCheckedSegmenter(saved[SEGMENTER_KEY]);
   syncParamLabels();
   syncSectionSummaries();
   return saved;
@@ -1009,59 +1025,166 @@ window.addEventListener('DOMContentLoaded', async () => {
   // 并发拉取：模型列表要转发到上游，比本地的目标列表慢得多。
   await Promise.all([loadExportTargets(), loadModels(), loadImageModels()]);
   restoreSession();
+
+  /*
+   * 分割器单选：变一次就提交一次。
+   *
+   * 没有"保存"按钮是有意的——切换是个即时动作（服务端立刻生效、worker
+   * 当场换掉），加个确认按钮反而会让人以为要先点一下才生效。
+   *
+   * 绑在这里而不是模块顶层：顶层绑的话就依赖"脚本在 DOM 之后执行"这个
+   * 假设（现在确实满足，但加个折叠区块或挪一下 script 就会静默失效）。
+   */
+  for (const el of document.querySelectorAll('input[name="segmenter"]')) {
+    el.addEventListener('change', () => {
+      if (el.checked) switchSegmenter(el.value);
+    });
+  }
+
   // 不 await：状态查询是锦上添花，不该拖慢界面出来
   syncSamStatus();
 });
 
 /**
- * 查一次 MobileSAM 环境状态，把结果写进开关旁边的说明里。
+ * 两个分割器的静态描述。key 同时是 radio 的 value、后端的取值、
+ * 以及 /api/sam-status 的 alternates 里的键，三处必须一致。
+ */
+const SEGMENTERS = {
+  mobilesam: {
+    label: 'MobileSAM',
+    cost: '首次调用约 2 秒，之后每张图约 0.3 秒',
+    setup: 'node server/sam/setup.mjs',
+    blurb: '快，大块部件够用'
+  },
+  sam3: {
+    label: 'SAM 3',
+    cost: '每个部件约 4~5 秒，8 个部件约 90 秒',
+    setup: 'node server/sam/setup-sam3.mjs',
+    blurb: '慢，但细碎部件（眼镜、眼睛）更准'
+  }
+};
+
+/** 当前选中的分割器。没选中任何一项时返回 null */
+function checkedSegmenter() {
+  const el = document.querySelector('input[name="segmenter"]:checked');
+  return el ? el.value : null;
+}
+
+/** 程序化设置选中态。radio 的选中要靠 .checked，不是 .value */
+function setCheckedSegmenter(value) {
+  for (const el of document.querySelectorAll('input[name="segmenter"]')) {
+    el.checked = el.value === value;
+  }
+}
+
+/**
+ * 查一次分割环境状态，把结果写进控件里。
  *
- * 环境没装时不该让开关装成"能用"的样子——勾着一个跑不起来的选项，
- * 用户只会以为功能坏了。这里改成取消勾选 + 直接给出安装命令。
- * 服务端那边就算收到 useSam=true 也会自己降级，两处兜底。
+ * 三件事：
+ *   · 当前选的是哪个 → 同步到 radio 的选中态
+ *   · 两个环境各自装没装 → 没装的那个置灰，并在提示里给出安装命令
+ *   · 生成进行中 → 切换控件禁用（服务端也会拒绝，见 /api/segmenter）
+ *
+ * 环境没装的选项不该装作"能用"——选了一个跑不起来的东西，用户只会以为
+ * 功能坏了。服务端那边就算收到也会自己降级，两处兜底。
  */
 async function syncSamStatus() {
   const toggle = document.getElementById('samToggle');
   const hint = document.getElementById('samHint');
-  if (!toggle || !hint) return;
+  const radios = [...document.querySelectorAll('input[name="segmenter"]')];
+  if (!toggle || !hint || !radios.length) return;
 
   try {
     const res = await fetch('/api/sam-status');
     const st = await res.json();
 
-    /*
-     * 两个分割器的耗时差两个数量级，提示语不能共用一套。
-     * 拿 MobileSAM 的"每张约 0.3 秒"去描述 SAM 3（实测每部件约 4.5 秒、
-     * 8 个部件约 90 秒）会让人以为卡死了，反过来则白劝退。
-     */
-    const sam3 = st.segmenter === 'sam3';
-    const label = sam3 ? 'SAM 3' : 'MobileSAM';
-    const cost = sam3
-      ? '每个部件约 4~5 秒，8 个部件约 90 秒'
-      : '首次调用约 2 秒，之后每张图约 0.3 秒';
+    setCheckedSegmenter(st.segmenter);
 
-    // 标签跟着实际用的分割器走。写死成 MobileSAM 的话，切到 SAM 3 之后
-    // 界面上写着 MobileSAM、实际跑的是 SAM 3，排查问题时最容易被这条误导。
-    const nameEl = document.getElementById('samLabel');
-    if (nameEl) nameEl.textContent = label;
+    /*
+     * 置灰没装的那个。alternates 是服务端报的两个环境各自的就绪状态 ——
+     * 这是它唯一的用途，之前前端一直没用过。
+     */
+    for (const el of radios) {
+      const available = st.alternates?.[el.value];
+      el.disabled = st.generating === true || available !== true;
+      el.closest('label')?.setAttribute('title',
+        available === true ? '' : `未安装，先运行：${SEGMENTERS[el.value]?.setup ?? ''}`);
+    }
+
+    const cur = SEGMENTERS[st.segmenter] || SEGMENTERS.mobilesam;
 
     if (st.ok) {
       toggle.disabled = false;
-      hint.textContent = st.running
-        ? `${label} 已在运行，切图轮廓精确到像素级`
-        : `用 ${label} 把每个部件的轮廓描到像素级，切图里不再混进邻件。纯本地计算，${cost}`;
+      // 选中的那个的特性由 radio 自己表达了，hint 只说清它自己的事：
+      // 在跑没在跑、要等多久。两个分割器耗时差两个数量级，不能共用一套说辞——
+      // 拿"每张约 0.3 秒"描述 SAM 3（实测 8 个部件约 90 秒）会让人以为卡死了。
+      const parts = [st.generating ? '正在生成…' : (st.running ? '已在运行' : null),
+        `${cur.label}：${cur.cost}`];
+      hint.textContent = parts.filter(Boolean).join('，')
+        + '。切图轮廓精确到像素级，被挡住的地方留成透明，正好交给补图。';
       hint.style.color = '';
       return;
     }
-    // 没装：取消勾选并说明怎么装
+
+    // 当前选的那个没装：关掉开关并说明怎么装
     toggle.checked = false;
     toggle.disabled = false;
-    hint.textContent = `未安装 ${label}，当前用 AI 多边形轮廓切图（较粗）。安装后切图轮廓精确到像素级：`
-      + (st.setupCommand || 'node server/sam/setup.mjs');
+    hint.textContent = `未安装 ${cur.label}，当前用 AI 多边形轮廓切图（较粗）。安装后切图轮廓精确到像素级：`
+      + cur.setup;
     hint.style.color = 'var(--warning, #b8860b)';
   } catch {
     // 服务端没响应时保持原样，不干扰用户
   }
+}
+
+/**
+ * 切到另一个分割器。
+ *
+ * 服务端会立刻生效（不用重启）并写进 .env 让下次启动记得。
+ * 失败时把 radio 的选中态退回去——界面显示的和实际生效的不一致，
+ * 比直接报错更难查。
+ */
+async function switchSegmenter(value) {
+  const radios = [...document.querySelectorAll('input[name="segmenter"]')];
+  // 记住切换前选中谁。失败时退回去——只报个错但界面还停在新的那项，
+  // 用户会以为切成功了。
+  const before = radios.find((el) => el.checked && el.value !== value)?.value;
+
+  for (const el of radios) el.disabled = true;
+
+  try {
+    const res = await fetch('/api/segmenter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segmenter: value })
+    });
+    const data = await readJson(res, '切换分割器');
+
+    if (!data.success) {
+      throw new Error(data.error || '切换失败');
+    }
+
+    const label = SEGMENTERS[value]?.label ?? value;
+    if (data.unchanged) {
+      addLog(`分割器已经是 ${label}`, 'info');
+    } else if (data.envError) {
+      // 内存里切好了、本次能用，只是没记住。报错会让用户以为切换失败了
+      showStatus(`⚠️ 已切到 ${label}，但写入 .env 失败：${data.envError}`, 'warning');
+      addLog(`已切到 ${label}，但写入 .env 失败（重启后会回到原来的）：${data.envError}`, 'warning');
+    } else {
+      showStatus(`✅ 已切换到 ${label}`, 'success');
+      addLog(`分割器已切换到 ${label}（已写入 .env）`, 'success');
+    }
+  } catch (err) {
+    // 退回原来的选中态，别让界面显示的和实际生效的不一致
+    if (before) setCheckedSegmenter(before);
+    showStatus(`切换分割器失败：${err.message}`, 'error');
+    addLog(`切换分割器失败：${err.message}`, 'error');
+  }
+
+  // 无论成败都重新同步一次：拿到真实的服务端状态，顺便把 disabled 恢复正确
+  await syncSamStatus();
+  persistInputs();
 }
 
 // 窗口尺寸变化时重算画布，避免预览被拉伸
@@ -1383,6 +1506,10 @@ generateBtn.addEventListener('click', async () => {
   formData.append('tightCut', document.getElementById('tightCutToggle').checked ? 'true' : 'false');
   formData.append('snap', document.getElementById('snapToggle').checked ? 'true' : 'false');
   formData.append('useSam', document.getElementById('samToggle').checked ? 'true' : 'false');
+  // 按次指定分割器。默认值由服务端从 .env 读，这里显式带上是为了让界面
+  // 上选的那个和本次实际用的那个永远一致——不然界面上写着刚切的 SAM 3、
+  // 实际跑的还是 .env 里的旧值，这类不一致最难查。
+  formData.append('segmenter', checkedSegmenter() || 'mobilesam');
   formData.append('background', document.getElementById('backgroundToggle').checked ? 'true' : 'false');
   formData.append('imageModel', document.getElementById('imageModelSelect').value);
   formData.append('maxInpaintAttempts', document.getElementById('maxInpaintInput')?.value ?? '2');

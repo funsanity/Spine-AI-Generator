@@ -190,6 +190,39 @@ header h1 {
   flex: none;
 }
 
+/*
+ * 分割器单选组：两个选项横排在同一行。
+ *
+ * .form-group label 是 display:block（见下面那条），会把两个 label 拆成
+ * 两行，所以这里用 flex 把整组变成一行。label 自己的 margin-bottom 也要
+ * 归零——它本来是给竖排表单留的间距，横排时会在下方顶出一条空隙。
+ */
+.form-group .seg-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 2px 0 0 22px;   /* 左边缩进，对齐到上面"启用像素级分割"的文字下方 */
+}
+
+.form-group .seg-row label {
+  display: flex;
+  margin-bottom: 0;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.form-group .seg-row input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--primary);
+  flex: none;
+}
+
+/* 环境没装的那一项：置灰但要看得见，配合 hint 里的安装命令 */
+.form-group .seg-row input[type="radio"]:disabled + span {
+  color: var(--text-muted);
+}
+
 .form-group code {
   padding: 1px 4px;
   border-radius: 3px;
