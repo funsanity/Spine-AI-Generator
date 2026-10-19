@@ -432,12 +432,20 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
    * （glasses 对 head、shoes 对 body），大的那个多半是把邻件顺带圈进来了。
    * 再平就按名字，只为了让结果稳定可复现——同一张图跑两次不该给出两种归属。
    *
-   * 只在有 SAM 掩码时建表。polygon 路径继续走原来的按遮挡者轮廓擦除：
-   * polygon 是 AI 报的顶点，粗到会把细弧整块划给大色块，拿它定"唯一归属"
-   * 会擦掉大片本该可见的内容，比重复更糟。
+   * **所有部件都进归属表，不管有没有 SAM 掩码**。polygon 路径之前「在轮廓内
+   * 就保留」，实测 kkk.png 那轮 body 的轮廓把披风整个圈住了，于是披风在 body
+   * 切图里留一整份，串味率从没掩码那一遍的 6% 暴涨到 17.7%。改成「先问归属表」
+   * 之后，轮廓内也得看是不是自己的，不是的就让位。
+   *
+   * 声明分三档，按精度从高到低，前一档定了的像素后一档不再改判：
+   *   SAM 掩码 —— 像素级、只含可见部分，最可信
+   *   polygon   —— AI 的顶点，粗，但按要求是含被遮挡部分的完整形状
+   *   bbox      —— 只剩框时按框认领（第三遍）
+   * SAM 压过 polygon 是因为 polygon 粗：前层手臂的轮廓多划进一条披风边，
+   * 那条边 SAM 说是披风，就该是披风。
    */
-  let ownerOf = null;
-  if (samMasks.size) {
+  const ownerOf = new Array(srcW * srcH).fill(null);
+  {
     // 面积先算好：打平时要比，放在循环里会重复扫整张掩码
     const areaOf = new Map();
     for (const [name, mask] of samMasks) {
@@ -447,10 +455,10 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
     }
 
     /** 谁更有资格认领同一个像素：depth 大的赢，平了面积小的赢，再平按名字 */
-    const better = (a, b) => {
+    const better = (a, b, area = areaOf) => {
       const da = depthOf.get(a) ?? 0, db = depthOf.get(b) ?? 0;
       if (da !== db) return da > db;
-      const aa = areaOf.get(a) ?? Infinity, ab = areaOf.get(b) ?? Infinity;
+      const aa = area.get(a) ?? Infinity, ab = area.get(b) ?? Infinity;
       if (aa !== ab) return aa < ab;
       return a < b;
     };
@@ -486,7 +494,6 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
       return out;
     };
 
-    ownerOf = new Array(srcW * srcH).fill(null);
     let contested = 0;
     let clippedOut = 0;
     for (const [name, rawMask] of samMasks) {
@@ -516,7 +523,46 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
     }
 
     /*
-     * 第三遍：补上**没有任何掩码认领**的像素。
+     * 第二遍：polygon 认领 SAM 没定下来的像素，多边形之间按 depth 判。
+     *
+     * 实测 kkk.png：sam3 对 13 个部件里 7 个"无命中"（"upper arm l" 这种
+     * 提示词它不认），全退回 polygon。polygon 分支原来「轮廓内一律保留」，
+     * 不进归属表——body 的完整轮廓圈住了压在它上面的披风，披风就在 body
+     * 里留一整份：body ← cape 48803px，全图 17.7% 的可见像素进了两张图。
+     *
+     * 有 SAM 掩码的部件也拿 polygon 参与这一遍：sam3 的掩码常常只盖住一部分
+     * （cape 只占框内 32.6%），掩码没盖到、自己轮廓又圈住的地方，
+     * 比起交给更靠后的大轮廓，归它更合理。
+     */
+    const samClaimed = new Uint8Array(srcW * srcH);
+    for (let i = 0; i < ownerOf.length; i++) if (ownerOf[i] !== null) samClaimed[i] = 1;
+    const polyArea = new Map();
+    const polyMasks = [];
+    for (const part of parts) {
+      if (!Array.isArray(part.polygon) || part.polygon.length < 3) continue;
+      const m = fillPolygon(part.polygon, srcW, srcH, 0, 0);
+      let n = 0;
+      for (let i = 0; i < m.length; i++) if (m[i]) n++;
+      polyArea.set(part.name, n);
+      polyMasks.push([part.name, m]);
+    }
+    let polyClaimed = 0, polyContested = 0;
+    for (const [name, m] of polyMasks) {
+      for (let i = 0; i < m.length; i++) {
+        if (!m[i] || samClaimed[i]) continue;
+        if (srcAlpha[i * 4 + 3] < ALPHA_CUTOFF) continue;
+        const cur = ownerOf[i];
+        if (cur === null) { ownerOf[i] = name; polyClaimed++; continue; }
+        polyContested++;
+        if (better(name, cur, polyArea)) ownerOf[i] = name;
+      }
+    }
+    if (polyClaimed) {
+      console.log(`[切图] ⬡ 多边形认领 ${polyClaimed}px（其中 ${polyContested}px 有多个轮廓重叠，按 depth 判给最靠前的）`);
+    }
+
+    /*
+     * 第三遍：**框认领** —— 按 bbox 补上无掩码、无轮廓、也没被别人认领的像素。
      *
      * 这是用户报的"头部在断裂滑动"的真正成因。MobileSAM 是纯框提示，
      * 取的是 score 最高的那张掩码——头这个框里它给的是**头发**，
@@ -713,8 +759,15 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
    * 大色块传染出去，没有上限的话一个误判就能把窗口撑到整张图
    * （实测 role5 有过 head 掩码吃到 torso 的情况）。
    */
+  let reseamed = 0;
+  for (let pass = 0, n = 1; pass < SEAM_PASSES && n; pass++) {
+    n = refineSeamOwnership(ownerOf, srcAlpha, srcW, srcH, depthOf);
+    reseamed += n;
+  }
+  if (reseamed) console.log(`[切图] ✂ 接缝上 ${reseamed}px 颜色属于后层，还给后层（前层切口不再带一条邻件的颜色）`);
+
   const ownsBox = new Map();
-  if (ownerOf && growCap > 0) {
+  if (growCap > 0) {
     for (let y = 0; y < srcH; y++) {
       for (let x = 0; x < srcW; x++) {
         const o = ownerOf[y * srcW + x];
@@ -873,481 +926,124 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
         .toBuffer({ resolveWithObject: true });
 
       /*
-       * 掩码切图：只保留"轮廓内、且源图上真有内容"的像素。
+       * 切图：只留归属表判给本部件的像素。
        *
-       * 这是「西红柿里不能有篮子」的唯一解法。矩形 extract 必然框进邻件：
-       * 西红柿的 bbox 一旦扩到包含被遮住的底部，框里就同时出现了提手、
-       * 篮圈和旁边西瓜的一块——实测就是这样，用户看到的"不干净"。
+       * 归属表已经把 SAM 掩码、polygon、框、连通性四种声明按 depth 合成了
+       * 「每个源像素归谁」，这里只照判决执行，三种轮廓来源走同一条路。
+       * 以前是三条分支各管各的：SAM 分支看归属表，polygon 分支「轮廓内一律
+       * 保留」，矩形分支整窗保留——后两条正是串味的来源（实测 kkk 那轮
+       * 7 个部件退回 polygon，body ← cape 48803px）。
        *
-       * 轮廓有两个来源，优先用 SAM：
-       *
-       *   SAM 掩码 —— 像素级，只包含这件东西**可见**的像素。提手压在
-       *     番茄上的那条弧天然不在番茄掩码里，切出来就是纯番茄；被挡住
-       *     的地方留成透明，正好是补图该接手的输入。
-       *
-       *   polygon —— AI 给的顶点，粗。让语言模型报顶点时，它倾向于把
-       *     "细弧压在大色块上"的边界整块划给大色块，所以提手会被包进
-       *     番茄轮廓。中空结构（提手那种拱形）它更会连洞一起框住，
-       *     实测轮廓内 44~53% 的像素源图上根本是透明的。
-       *
-       * 两者都要再和源图不透明像素求交集：轮廓定"哪里可能属于我"，
-       * 源图定"哪里真的画了东西"。被遮挡处（源图透明）不属于任何部件。
-       *
-       * 都没有时退回纯矩形切图，行为与改造前一致。
+       * 不归我的像素 RGB 一并清零，不只是 alpha：补图把整张图送进模型，
+       * 模型看的是 RGB。透明像素底下存着源图原色的话，模型拿到的其实是
+       * 整张场景裁剪（实测 kkk 的 body.png，alpha=0 但源图有内容的像素里
+       * 95.9% 原样存着披风、上衣的颜色），照着补出来的就是邻件。
+       * 清零之后再扩散，透明区铺开的只是本部件自己的颜色。
        */
-      let masked = data;
       const samMask = samMasks.get(name);
       const usedSam = !!samMask;
-      /*
-       * 归属判给别人、因此从本部件擦掉的那些像素。
-       *
-       * 和深度擦除的 erasedMask 是一回事（都是"这里原来有内容、被拿走了、
-       * 补图该填"），只是来源不同：一个来自 depth 表，一个来自归属表。
-       * 落盘前并成同一张掩码，补图那边不需要区分。
-       */
-      let yieldedMask = null;
-
-      if (samMask) {
-        /*
-         * 窗口内逐像素套用掩码。窗口就是 extract 出来的那块，
-         * 掩码是源图尺寸的，按 (x0, y0) 偏移对齐。
-         */
-        masked = Buffer.from(data);
-        let clipped = 0;
-        let yielded = 0;
-        let keptByBox = 0;
-        for (let y = 0; y < h; y++) {
-          const srcRow = (y + y0) * srcW;
-          const winRow = y * w;
-          for (let x = 0; x < w; x++) {
-            const di = (winRow + x) * 4;
-            if (masked[di + 3] < ALPHA_CUTOFF) continue;   // 源图这儿本来就空
-            const si = srcRow + x + x0;
-
-            if (!samMask[si]) {
-              /*
-               * 掩码没盖住这里，但归属表判给了本部件 —— 保留。
-               *
-               * 归属表判给本部件、而本部件的 SAM 掩码又没盖住，只有一种来源：
-               * 第三遍「按框补齐」。MobileSAM 是纯框提示，头这个框里它给出的
-               * 是**头发**（实测只盖住框内 32.5% 的不透明像素），脸、下巴、
-               * 耳朵全在掩码外。不认这一遍，这些像素就会被当成"掩码外"删掉——
-               * 而它们恰恰是头的一部分，删掉就是用户看到的"头转了脸不转"。
-               */
-              if (ownerOf && ownerOf[si] === name) {
-                keptByBox++;
-                continue;
-              }
-              masked[di + 3] = 0;                            // 掩码外且不归我：让位
-              clipped++;
-              continue;
-            }
-            /*
-             * 掩码内、但归属判给了别人（更靠前的那一层）：让位。
-             *
-             * 这就是「头部不再出现在多张图上」的落点。上面的归属表已经把
-             * 重叠区判给了 depth 最大的那个部件，这里照判决执行。
-             * 让位的像素下面会记进 erasedMask，补图把它填成合理的内容。
-             */
-            if (ownerOf && ownerOf[si] !== null && ownerOf[si] !== name) {
-              masked[di + 3] = 0;
-              yielded++;
-            }
-          }
-        }
-        if (clipped || yielded || keptByBox) {
-          const total = w * h;
-          const extra = (yielded ? `，另让给更靠前的层 ${yielded}px` : '') +
-                        (keptByBox ? `，按框认回掩码外的 ${keptByBox}px` : '');
-          console.log(`[切图] ⛶ ${name} 按 SAM 掩码裁掉 ${clipped}px（占窗口 ${(clipped / total * 100).toFixed(1)}%）${extra}`);
-        }
-        // 让位的像素要补：记下来，下面和深度擦除的结果并进同一张 erasedMask
-        if (yielded) {
-          yieldedMask = new Uint8Array(w * h);
-          for (let y = 0; y < h; y++) {
-            const srcRow = (y + y0) * srcW;
-            for (let x = 0; x < w; x++) {
-              const si = srcRow + x + x0;
-              if (!samMask[si]) continue;
-              if (srcAlpha[si * 4 + 3] < ALPHA_CUTOFF) continue;
-              if (ownerOf[si] !== null && ownerOf[si] !== name) yieldedMask[y * w + x] = 1;
-            }
-          }
-        }
-      } else if (hasPoly) {
-        const polyMask = fillPolygon(poly, w, h, x0, y0);
-        masked = Buffer.from(data);
-        let clipped = 0, keptByBox = 0;
-        for (let y = 0; y < h; y++) {
-          const srcRow = (y + y0) * srcW;
-          for (let x = 0; x < w; x++) {
-            const i = y * w + x;
-            if (masked[i * 4 + 3] < ALPHA_CUTOFF) continue;   // 源图这儿本来就空
-            if (polyMask[i]) continue;                        // 在轮廓内，保留
-            /*
-             * 轮廓外，但归属表判给了本部件 —— 保留。
-             *
-             * 和 SAM 分支的「按框认领」是同一条规则，以前只写在 SAM 分支里。
-             * 后果实测出来的：`right_arm_and_scissors` 的 SAM 掩码几乎是空的
-             * （占框内 11.0%），被降级到 polygon 路径；可那份小掩码仍然参与
-             * 了归属表，把框内属于它的像素都判给了它，然后 polygon 这一句
-             * 又把它们当"轮廓外的邻件"删掉——17416px 有内容却谁都没画，
-             * 渲染出来手臂中间一串竖直白碎片。
-             *
-             * 边界情况：polygon 是 AI 给的粗略轮廓，正常应该收得比内容紧，
-             * 所以"轮廓外归属于我"本身就已经说明多边形不准了，此时以归属
-             * 表的判决为准（框是 SAM 的提示，也是这个部件位置的上界）。
-             */
-            const owner = ownerOf ? ownerOf[srcRow + x + x0] : null;
-            if (owner === name) {
-              keptByBox++;
-              continue;
-            }
-
-            /*
-             * 归属表里**根本没有本部件**时（掩码被判太差、没进表），
-             * 上面那条判断永远为假，轮廓外属于它的内容会被整片删掉。
-             *
-             * 实测 role2：`left_arm` 的掩码几乎为空（占框内 8.9%）被丢掉，
-             * 它整条袖子在框外的那 1577px 就谁都不画了（漏失 1.12%，
-             * 主块 1343px 在 x232..290 y587..740，正是袖子的下段）。
-             *
-             * 兜底只认领**别的框都没圈住**的像素：没有掩码就没有证据说这块
-             * 是我的，只能靠"没有别人声索"来判。有别的框压着就让给那个框
-             * ——那条规则（面积小的框更具体）已经在第二遍里定过案了。
-             */
-            if (!owner) {
-              const claimedByOther = parts.some((o) => {
-                if (o.name === name || !o.bbox) return false;
-                const b = o.bbox;
-                return x + x0 >= b.x && x + x0 < b.x + b.width
-                  && y + y0 >= b.y && y + y0 < b.y + b.height;
-              });
-              if (!claimedByOther) {
-                keptByBox++;
-                continue;
-              }
-            }
-
-            masked[i * 4 + 3] = 0;
-            clipped++;
-          }
-        }
-        if (clipped || keptByBox) {
-          const total = w * h;
-          const extra = keptByBox ? `，按框认回轮廓外的 ${keptByBox}px` : '';
-          console.log(`[切图] ⬟ ${name} 裁掉轮廓外的邻件 ${clipped}px（占窗口 ${(clipped / total * 100).toFixed(1)}%）${extra}`);
+      const masked = Buffer.from(data);
+      let kept = 0, given = 0;
+      for (let y = 0; y < h; y++) {
+        const srcRow = (y + y0) * srcW;
+        for (let x = 0; x < w; x++) {
+          const di = (y * w + x) * 4;
+          const opaque = data[di + 3] >= ALPHA_CUTOFF;
+          if (opaque && ownerOf[srcRow + x + x0] === name) { kept++; continue; }
+          if (opaque) given++;
+          masked[di] = 0; masked[di + 1] = 0; masked[di + 2] = 0; masked[di + 3] = 0;
         }
       }
 
       /*
-       * 按深度擦除：把所有比本部件靠前的部件的不透明像素从切图里挖掉。
+       * 补图区：本部件自己的形状延伸到这里、但这里被**更靠前**的部件占着。
        *
-       * 必须在 bleedAlpha 之前做——扩散会把颜色推进透明区，先擦后扩散，
-       * 补图才有「这里缺内容」的信号；先扩散后擦，擦完边缘没有可扩散的
-       * 邻色，补图接不上。
+       * 「自己的形状」= SAM 掩码 ∪ polygon（polygon 按要求含被遮挡部分），
+       * 两样都没有才退回框。以前标的是「遮挡者在窗口里的整个轮廓」：
+       * 披风比身体宽，body 的补图区就成了一块披风形状，补出来 body.png 里
+       * 多一块披风剪影。
        *
-       * 擦的是遮挡者的**不透明像素**而不是它的矩形框：框会把被擦方自己
-       * 也一起擦掉（两者的框必然相交）。只有遮挡者真正画了东西的地方
-       * 才属于它，那里才是该让位的区域。
+       * 只认更靠前的占位者：被同层或更靠后的部件占着，说明那里看得见的
+       * 是它们、本部件根本没延伸过去（polygon 划宽了），不该补。
        *
-       * src 只在开 snap 时读取；这里需要它来判断遮挡者的实际轮廓，
-       * 所以没开 snap 时按需读一次。
+       * SAM 掩码重叠、判给前层的那片（归属让位）也落在这条规则里：
+       * 它在本部件的掩码内、被前层占着。
+       *
+       * 补图区不写源图颜色：那里的源图像素画的是遮挡者，不是本部件。
+       * 以前把它当"真值"贴回 body，body.png 里就多了一份披风——实测
+       * 串味率从 17.7% 涨到 45.4%。
        */
-      const ahead = frontOf.get(name) ?? [];
-      /*
-       * 记下"哪些像素是被擦掉的"，交给补图。
-       *
-       * 补图那边靠「透明区连不连到图边」区分"部件外的 padding"（保持透明）
-       * 和"部件身上的洞"（填实）。深度擦除造出了第三种东西：被前方部件
-       * 挖掉的一大片，它按定义连到图边，却正是最该填的地方。
-       * 不把这张掩码传过去，补图会把模型补出来的内容整片丢掉——
-       * 实测 basket_back 报"补了 99%"，落盘却只有 0.8% 不透明。
-       */
+      const polyMask = hasPoly ? fillPolygon(poly, w, h, x0, y0) : null;
+      const rx0 = Math.round(bbox.x), ry0 = Math.round(bbox.y);
+      const rx1 = Math.round(bbox.x + bbox.width), ry1 = Math.round(bbox.y + bbox.height);
+      const myDepth = depthOf.get(name) ?? 0;
       let erasedMask = null;
-      /*
-       * frontMask：被擦掉的像素里，有多少是**盖在前面的那个部件的轮廓**。
-       *
-       * 这一片和"部件自己身上的洞"要分开对待。自己身上的洞（接缝、被邻件
-       * 挡掉的一小块）该由补图填实，那是真缺口；而这一片是被前方部件整个
-       * 盖住的区域，补图**没有真值可参考**——它看不到下面是什么，只能照着
-       * 画面里还看得见的东西推。
-       *
-       * 实测就是这么翻的车：围裙压在裙子上，裙子那片擦除区里补出来的
-       * 全是围裙的紫灰（108,99,120），平均比源图暗 27 个色阶，只有 4.3%
-       * 的像素和源图接近。静态切图看不出来——那片像素 alpha 是 0，预览里
-       * 不显示；可两片按不同骨头转起来，它就是围裙的一份重影。实测
-       * skirt∩apron 重叠 69669px、98% 落在裙子这个擦除区里。
-       *
-       * 所以这片要单独标出来，补图把它的 alpha 一律留 0（内容随便补，
-       * 反正看不见），别再产出"看起来像内容"的重影。
-       */
-      let frontMask = null;
-      /*
-       * 归属让位的像素同样要补，所以 erasedMask 的起点是 yieldedMask。
-       *
-       * 两者合并而不是二选一：一个部件可能既让位给了重叠判决（头颈那块），
-       * 又被深度擦除挖掉了另一片（前方部件盖住的地方）。只传一张，
-       * 另一片就会被补图当成"部件外的留白"留成透明，预览里就是个黑洞。
-       */
-      if (yieldedMask) erasedMask = yieldedMask;
-
-      if (ahead.length && masked) {
-        erasedMask ??= new Uint8Array(w * h);
-        let cleared = 0;
-        for (const occ of ahead) {
-          /*
-           * 遮挡者的掩码 = 它的轮廓 ∩ 源图上它真正画了东西的地方。
-           *
-           * 只用轮廓：轮廓内的透明像素（比如提手两弧之间的空隙）不算遮挡，
-           * 擦掉它会把本部件在那里本来就有的内容误伤——这正是"提手内侧
-           * 多出一个方形缺口"的成因，老代码按矩形擦所以整片都挖了。
-           *
-           * 轮廓优先用 SAM 掩码（像素级），没有就退回 polygon，
-           * 再没有就退回矩形范围（改造前的老行为）。
-           */
-          const ob = occ.bbox;
-          const ox0 = Math.max(0, Math.round(ob.x) - x0);
-          const oy0 = Math.max(0, Math.round(ob.y) - y0);
-          const ox1 = Math.min(w, Math.round(ob.x + ob.width) - x0);
-          const oy1 = Math.min(h, Math.round(ob.y + ob.height) - y0);
-          if (ox1 <= ox0 || oy1 <= oy0) continue;
-
-          const occSam = samMasks.get(occ.name) ?? null;
-          const occPoly = !occSam && Array.isArray(occ.polygon) && occ.polygon.length >= 3
-            ? fillPolygon(occ.polygon, w, h, x0, y0)
-            : null;
-
-          for (let y = Math.max(0, oy0); y < oy1; y++) {
-            const srcRow = (y + y0) * srcW;
-            for (let x = Math.max(0, ox0); x < ox1; x++) {
-              const i = y * w + x;
-              // 有 SAM 掩码只认掩码；有 polygon 只认轮廓内；都没有就整框
-              if (occSam) {
-                if (!occSam[srcRow + x + x0]) continue;
-                /*
-                 * 遮挡者还得**真的拥有**这里，否则不算它盖住了。
-                 *
-                 * SAM 的掩码会外溢：实测眼镜那个框，掩码覆盖 10039px，
-                 * 而眼镜本身只有 9889px——多出来的是整张脸。眼镜 depth=3
-                 * 比头深，于是 head 的脸（脸中心 rgb(249,190,163) 皮肤色）
-                 * 被当成"被眼镜盖住"整片擦掉，补图再把 alpha 压成 0，
-                 * 切出来的 head 是一张没有脸的头。
-                 *
-                 * 归属表已经按 depth 判过每个像素归谁，这里照判决执行：
-                 * 判给遮挡者的才算遮挡。没有归属表（polygon 路径）时维持原行为。
-                 */
-                if (ownerOf && ownerOf[srcRow + x + x0] !== null
-                    && ownerOf[srcRow + x + x0] !== occ.name) continue;
-              } else if (occPoly && !occPoly[i]) {
-                continue;
-              }
-
-              /*
-               * 归属表判给本部件的像素不让位。
-               *
-               * 这里原来的判据是「本部件的 SAM 掩码认领的像素不让位」，为的是
-               * 防止擦空：SAM 掩码之间会重叠，擦除只看遮挡者的掩码，会把本部件
-               * 真正可见的内容一起删（实测 left_arm 只剩 4.3% 不透明）。
-               *
-               * 但这条豁免同时放过了**重叠中不该保留的那一半**：body 的掩码把
-               * 头颈一起圈了进来，豁免一生效，头的像素就在 body 上留下了一份，
-               * head 自己也有一份，于是"头部在多个部件都有"、动画里断裂滑动。
-               *
-               * 改判归属表：重叠区已经按 depth 判过唯一归属，判给本部件的才留。
-               * 防擦空的效果不变（真正属于自己的那一半照样留住），而判给别人的
-               * 那一半这次会让位——两个问题一条规则同时解决。
-               *
-               * 没有 SAM 掩码时（polygon 路径）维持原行为。
-               */
-              if (ownerOf) {
-                if (ownerOf[srcRow + x + x0] === name) continue;
-              } else if (samMask && samMask[srcRow + x + x0]) {
-                continue;
-              }
-              const si = ((y + y0) * srcW + (x + x0)) * 4 + 3;
-              if (srcAlpha[si] < ALPHA_CUTOFF) {
-                /*
-                 * 遮挡者盖住这里，但源图**这里本来就是空的**。
-                 *
-                 * 没有内容要擦（masked 本来就是 0），可这片正是"补图没有
-                 * 真值可参考"的地方——裙子画到围裙边缘就断了，那块源图是
-                 * 透明的。所以不用 erased（没有内容要填回来），但要记进
-                 * frontMask：下面统计"这片里有多少是空的"就靠它。
-                 */
-                if (occSam) (frontMask ??= new Uint8Array(w * h))[i] = 2;
-                continue;
-              }
-              const di = i * 4;
-              /*
-               * 用源图 alpha（si）而不是 masked[di+3] 判断"本来没内容"。
-               *
-               * masked 此时可能已被 SAM 裁过：前方部件（如围裙）覆盖的身体像素
-               * 已被 SAM 置零。旧代码在这里判 masked[di+3] < ALPHA_CUTOFF 就
-               * continue——结果这些像素也没写进 erasedMask，补图的 markExteriorGap
-               * 把整片区域当外部留白保持透明，预览里上半身变成黑洞。
-               *
-               * 改用 srcAlpha 判断后，只要源图这里有内容就写 erasedMask；
-               * masked 仍然需要置零（polygon 路径下这里可能还是原值）。
-               */
-              masked[di + 3] = 0;
-              erasedMask[i] = 1;
-              cleared++;
-            }
-          }
-        }
-        if (cleared) console.log(`[切图] ⌫ ${name} 擦除前方遮挡 ${cleared}px（${ahead.map(o => o.name).join(', ')}）`);
-
-        /*
-         * frontMask：被前方部件盖住的那片 —— 「补图看不到下面是什么」的区域。
-         *
-         * 这一片和"部件自己身上的洞"要分开对待。自己身上的洞（接缝、被邻件
-         * 挡掉的一小块）该由补图填实，那是真缺口；而这一片是被前方部件整个
-         * 盖住的区域，补图没有真值可参考，只能照着画面里还看得见的东西推。
-         *
-         * 实测就是这么翻的车：围裙压在裙子上，裙子那片擦除区里补出来的
-         * 全是围裙的紫灰（108,99,120），平均比源图暗 27 个色阶。静态切图
-         * 看不出来（那片 alpha 是 0），两片按不同骨头转起来就是一层重影。
-         * 实测 body 在裙摆底下补出 [119,113,129]、源图那格是 [108,96,118]；
-         * head 在镜片底下补出 [246,183,157]、源图那格是 [225,173,159]。
-         *
-         * 判据按定义扫，不看擦除循环写了什么：擦除循环走到归属判决已经
-         * 让位的像素会提前 continue，压根到不了写记录那一支。所以这里直接
-         * 扫「遮挡者的掩码 ∩ 本部件的窗口」。
-         *
-         * 曾经这里还有一条"源图那块必须是空的才算 front"的门槛，用来防
-         * 小配件盖住大部件时把下面整片真值也压掉（眼镜盖脸）。那条门槛是
-         * 错的：源图那块之所以有内容，正是因为遮挡者本人画在那里，不是
-         * 被盖者自己的真值。眼镜那个 case 的真正病根是 SAM 掩码外溢到
-         * 自己的框外（10039px 掩码 vs 9889px 自身内容），已由 clipToBox 修掉，
-         * 不该在这里再用面积比兜一遍。实测那条门槛把 role7 和 12 的 front
-         * 全部判成 null（源图被盖处 100% 有内容），两件素材的重影直接漏网。
-         */
-        if (ahead.length && samMasks.size) {
-          const occUnion = new Uint8Array(w * h);
-          for (const occ of ahead) {
-            const occSam = samMasks.get(occ.name);
-            if (!occSam) continue;
-            const ob = occ.bbox;
-            const ox0 = Math.max(0, Math.round(ob.x) - x0);
-            const oy0 = Math.max(0, Math.round(ob.y) - y0);
-            const ox1 = Math.min(w, Math.round(ob.x + ob.width) - x0);
-            const oy1 = Math.min(h, Math.round(ob.y + ob.height) - y0);
-            for (let y = Math.max(0, oy0); y < oy1; y++) {
-              const srcRow = (y + y0) * srcW;
-              for (let x = Math.max(0, ox0); x < ox1; x++) {
-                if (occSam[srcRow + x + x0]) occUnion[y * w + x] = 1;
-              }
-            }
-          }
-          let n = 0;
-          frontMask = new Uint8Array(w * h);
-          for (let i = 0; i < w * h; i++) {
-            if (!occUnion[i]) continue;
-            frontMask[i] = 1;
-            n++;
-          }
-          if (!n) frontMask = null;
-          else console.log(`[切图] ↺ ${name} 被前方部件盖住 ${n}px（${ahead.map(o => o.name).join(', ')}）——这片交给源图真值，别让模型编`);
+      const erasedBy = new Map();
+      for (let y = 0; y < h; y++) {
+        const srcRow = (y + y0) * srcW;
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          const si = srcRow + x + x0;
+          const owner = ownerOf[si];
+          if (owner === null || owner === name) continue;
+          if ((depthOf.get(owner) ?? 0) <= myDepth) continue;
+          const inShape = samMask || polyMask
+            ? !!(samMask?.[si] || polyMask?.[i])
+            : x + x0 >= rx0 && x + x0 < rx1 && y + y0 >= ry0 && y + y0 < ry1;
+          if (!inShape) continue;
+          (erasedMask ??= new Uint8Array(w * h))[i] = 1;
+          erasedBy.set(owner, (erasedBy.get(owner) ?? 0) + 1);
         }
       }
 
-      /*
-       * 被挖走的地方，把**源图的真实颜色**填回去，但 alpha 保持 0。
-       *
-       * 只把 alpha 置零是不够的：那片区域的 RGB 也一起变成 0（透明黑），
-       * 补图拿到一张"挖空了颜色"的图，只能照着画面里还看得见的东西猜——
-       * 而围裙正好盖在裙子上，它就照着围裙的紫灰画满了整片，
-       * 补出来的每一块都是**前面那个部件的一份复制品**。
-       * 实测 skirt∩apron 重叠 69669px，其中 98% 落在裙子自己的擦除区里、
-       * 颜色是围裙的紫灰（108,99,120）而不是裙子该有的深灰（69,59,73）——
-       * 静态切图看不出来，两片一起按不同骨头转起来就是一层重影。
-       *
-       * 填回真实颜色之后，模型看到的是"这里本来就是裙子"，补出来接得上；
-       * 就算它还是照着围裙画，下面这张真实颜色 + 补图的 RGB 扩散也会把
-       * 边缘拉回裙子的色。alpha 一律不动，形状还是原轮廓。
-       *
-       * 只对**擦除区**这么做：源图本来就透明的 padding 不碰，那里没有真值。
-       */
-      if (erasedMask && src) {
-        for (let i = 0; i < w * h; i++) {
-          if (!erasedMask[i]) continue;
-          const sx = i % w, sy = (i / w) | 0;
-          const si = ((sy + y0) * srcW + (sx + x0)) * 4;
-          masked[i * 4] = src[si];
-          masked[i * 4 + 1] = src[si + 1];
-          masked[i * 4 + 2] = src[si + 2];
-          masked[i * 4 + 3] = 0;   // 形状不变
-        }
+      const contourTag = usedSam ? 'SAM' : (hasPoly ? '多边形' : '矩形');
+      if (given) {
+        console.log(`[切图] ⚖ ${name}（${contourTag}）留下 ${kept}px，窗口里 ${given}px 归别的部件，已让出`);
+      }
+      if (erasedMask) {
+        const n = [...erasedBy.values()].reduce((s, v) => s + v, 0);
+        const by = [...erasedBy].sort((a, b) => b[1] - a[1]).map(([o, c]) => `${o} ${c}px`).join('，');
+        console.log(`[切图] ⌫ ${name} 被前方部件盖住 ${n}px（${by}），交给补图`);
       }
 
-      const filled = bleed > 0 ? bleedAlpha(masked, info.width, info.height, bleed) : masked;
+      // 切口抗锯齿：只在本部件压着更靠后部件的那条边上往外羽化一圈
+      // 被更靠前部件压着的那条边，颜色还原成自己的纯色（前层会按混合比例叠上来）
+      const mine = new Uint8Array(w * h);
+      const behind = new Uint8Array(w * h);
+      const front = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) {
+        const srcRow = (y + y0) * srcW;
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          if (masked[i * 4 + 3]) { mine[i] = 1; continue; }
+          const owner = ownerOf[srcRow + x + x0];
+          if (data[i * 4 + 3] < ALPHA_CUTOFF || owner === null || owner === name) continue;
+          const d = depthOf.get(owner) ?? 0;
+          if (d < myDepth) behind[i] = 1;
+          else if (d > myDepth) front[i] = 1;
+        }
+      }
+      const smooth = featherFrontEdge(unmixBackEdge(masked, w, h, mine, front, data), w, h, mine, behind, data);
+
+      const filled = bleed > 0 ? bleedAlpha(smooth, info.width, info.height, bleed) : smooth;
 
       const outputPath = join(outputDir, `${name}.png`);
       await sharp(filled, { raw: { width: info.width, height: info.height, channels: 4 } })
         .png()
         .toFile(outputPath);
 
-      // 前方轮廓掩码：1 = 这一片是被前方部件整个盖住的，补图别把它算成形状
-      if (frontMask) {
-        const fmPath = join(outputDir, `${name}.front.png`);
-        const fmBuf = Buffer.alloc(w * h * 4);
-        for (let i = 0; i < w * h; i++) {
-          const val = frontMask[i] ? 255 : 0;
-          fmBuf[i * 4] = val;
-          fmBuf[i * 4 + 1] = val;
-          fmBuf[i * 4 + 2] = val;
-          fmBuf[i * 4 + 3] = 255;
-        }
-        await sharp(fmBuf, { raw: { width: w, height: h, channels: 4 } })
-          .png()
-          .toFile(fmPath);
-      }
-
       /*
-       * 擦除掩码：1 = 这个像素被深度擦除挖掉了，inpaint 应该填它。
+       * 擦除掩码：alpha 255 = 这一格要补，0 = 不用管。RGB 一律 0。
        *
-       * 顺手把**源图在那里的原样 RGB** 也写进这张 PNG 的像素里（alpha 仍是
-       * 掩码语义，255 = 被擦）。补图拿到它就能把这片直接贴回去，不用猜。
-       *
-       * 为什么必须贴回去而不是让模型补：被前方部件盖住的那片，模型看不到
-       * 下面是什么，只能照着画面里还看得见的东西推——推出来就是遮挡者的
-       * 一份复制品。实测 body 在裙摆底下补出 [119,113,129]，而源图那格是
-       * [108,96,118]（裙摆的紫灰）；head 在镜片底下补出 [246,183,157]，
-       * 源图那格是 [225,173,159]。静态切图看不出来，两片按不同骨头转起来
-       * 就是一层错色的重影。
-       *
-       * 源图那个像素不是"猜"——它就是当时真正显示的颜色。用户要的
-       * 「完整 Object RGBA」要的正是这一份，而不是模型的想象。
-       * 只有源图**那里本来就是空的**（真洞，实测两件素材合计 412px）才
-       * 留给模型补。
+       * alpha 是**掩码语义**，没被擦的必须留 0，否则整窗都会被当成擦除区、
+       * 补图把矩形贴实（实测就是把部件补成了 100% 不透明的实心矩形）。
        */
       if (erasedMask) {
-        const maskPath = join(outputDir, `${name}.erased.png`);
         const maskBuf = Buffer.alloc(w * h * 4);
-        for (let i = 0; i < w * h; i++) {
-          /*
-           * alpha 是**掩码语义**：255 = 这一格被擦、要补。没被擦的留 0，
-           * 否则整窗都会被当成擦除区、补图把矩形贴实（实测就是把部件
-           * 补成了 100% 不透明的实心矩形）。
-           * RGB 只在被擦且**有真值**时才有意义。
-           */
-          if (!erasedMask[i]) continue;
-          const sx = i % w, sy = (i / w) | 0;
-          const si = ((sy + y0) * srcW + (sx + x0)) * 4;
-          const inside = sx + x0 >= 0 && sy + y0 >= 0 && sx + x0 < srcW && sy + y0 < srcH;
-          const hasTruth = inside && srcAlpha[si + 3] >= ALPHA_CUTOFF;
-          if (hasTruth) {
-            maskBuf[i * 4] = srcAlpha[si];
-            maskBuf[i * 4 + 1] = srcAlpha[si + 1];
-            maskBuf[i * 4 + 2] = srcAlpha[si + 2];
-          }
-          // 没真值的真洞留 0,0,0：补图只看 alpha 是掩码，看 RGB 才知道能不能贴
-          maskBuf[i * 4 + 3] = 255;
-        }
+        for (let i = 0; i < w * h; i++) if (erasedMask[i]) maskBuf[i * 4 + 3] = 255;
         await sharp(maskBuf, { raw: { width: w, height: h, channels: 4 } })
           .png()
-          .toFile(maskPath);
+          .toFile(join(outputDir, `${name}.erased.png`));
       }
 
       // bbox 左上角挪了多少，pivot 就要往回补多少
@@ -1384,6 +1080,193 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
   console.log(`[切图] 完成，成功切出 ${results.length}/${parts.length} 张图片`);
 
   return results;
+}
+
+/**
+ * 接缝修正最多跑几轮。SAM 掩码外溢常常不止一格，一轮只能剥掉最外一圈；
+ * 每轮都按颜色判，纯前层颜色的格子 f≈1 永远不会被剥，所以多轮不会往里啃。
+ */
+const SEAM_PASSES = 3;
+
+/**
+ * 混合模型解释不了的颜色（残差超过这个 RGB 距离）不拆：多半是描线、高光
+ * 这类第三种颜色。实测 kkk 上把黑色描线当成「头发+皮肤的混合」拆掉，
+ * 描线变成平涂色，拼起来那条线就淡了。
+ */
+const SEAM_MAX_RESIDUAL = 30;
+
+/** 两侧颜色差不到这个距离（RGB 欧氏），按颜色拆不出混合比例，退回按几何 */
+const SEAM_MIN_CONTRAST = 40;
+
+/**
+ * 接缝上一个像素的颜色里，A 侧占几成。
+ *
+ * 画师在两块颜色交界画的是半透明过渡，那一两格的颜色 c ≈ f·A + (1−f)·B。
+ * A、B 取 5x5 邻域里两侧「内部」像素（四邻都同侧）的平均色，f 是 c 在 A−B
+ * 连线上的投影。两侧颜色太近（同色系接缝）或某侧没有内部样本时返回 null；
+ * c 离 f·A + (1−f)·B 太远（描线、高光）时 fits=false，调用方不该按 f 动它。
+ * 一并返回两侧内部平均色：前层的过渡格涂「纯的 A」，后层那格还原成「纯的 B」，
+ * 叠起来才等于源图那格的 f·A + (1−f)·B。
+ *
+ * @param {Buffer} rgba - 整幅 RGBA，行宽 width
+ * @param {(j:number)=>boolean} inA
+ * @param {(j:number)=>boolean} inB
+ */
+export function mixFraction(rgba, width, height, x, y, inA, inB) {
+  const sa = [0, 0, 0, 0], sb = [0, 0, 0, 0];
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 1 || ny < 1 || nx >= width - 1 || ny >= height - 1) continue;
+      const j = ny * width + nx;
+      for (const [inSet, acc] of [[inA, sa], [inB, sb]]) {
+        if (!inSet(j) || !inSet(j - 1) || !inSet(j + 1) || !inSet(j - width) || !inSet(j + width)) continue;
+        acc[0] += rgba[j * 4]; acc[1] += rgba[j * 4 + 1]; acc[2] += rgba[j * 4 + 2]; acc[3]++;
+      }
+    }
+  }
+  if (sa[3] < 2 || sb[3] < 2) return null;
+  let dot = 0, len = 0;
+  const i = (y * width + x) * 4;
+  for (let c = 0; c < 3; c++) {
+    const a = sa[c] / sa[3], b = sb[c] / sb[3];
+    dot += (rgba[i + c] - b) * (a - b);
+    len += (a - b) * (a - b);
+  }
+  if (len < SEAM_MIN_CONTRAST * SEAM_MIN_CONTRAST) return null;
+  const f = Math.min(1, Math.max(0, dot / len));
+  let res = 0;
+  for (let c = 0; c < 3; c++) {
+    const a = sa[c] / sa[3], b = sb[c] / sb[3];
+    res += (rgba[i + c] - (f * a + (1 - f) * b)) ** 2;
+  }
+  return {
+    f,
+    fits: res <= SEAM_MAX_RESIDUAL * SEAM_MAX_RESIDUAL,
+    color: [0, 1, 2].map((c) => Math.round(sa[c] / sa[3])),
+    other: [0, 1, 2].map((c) => Math.round(sb[c] / sb[3]))
+  };
+}
+
+/**
+ * 前层切口抗锯齿：切口外侧、压在更靠后部件身上的那一圈像素，给一点 alpha，
+ * 颜色取自己的。
+ *
+ * 归属表按像素 0/1 判，前层（头发压脸）的切口是硬阶梯；源图自带的轮廓
+ * 对着透明背景，画师画好了过渡，不用管。只往外扩、不往里收：往里收会让
+ * 前层边缘半透明，后层那格要是没补到就露缝；往外扩只是盖在后层自己的
+ * 像素上，后层一格不缺，动起来也不会裂。
+ *
+ * 给多少 alpha：两侧颜色拆得开时按 mixFraction（画师那格本来就是 f 成头发，
+ * 叠回去和源图一致），颜色用前层内部平均色；拆不开（同色系）退回 3x3 高斯核
+ * 的几何覆盖率，颜色用相邻自己像素的加权平均。
+ *
+ * @param {Buffer} buf - RGBA，本部件已切好的像素（不归自己的 alpha=0）
+ * @param {Uint8Array} mine - 1 = 归本部件
+ * @param {Uint8Array} behind - 1 = 源图不透明、归一个更靠后的部件
+ * @param {Buffer} src - 窗口内的源图 RGBA；alpha 不会比源图更实
+ * @returns {Buffer} 新缓冲，原缓冲不变
+ */
+export function featherFrontEdge(buf, width, height, mine, behind, src) {
+  const out = Buffer.from(buf);
+  const inMine = (j) => mine[j] === 1;
+  const inBehind = (j) => behind[j] === 1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (mine[i] || !behind[i]) continue;
+      let cov = 0, r = 0, g = 0, b = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const j = ny * width + nx;
+          if (!mine[j]) continue;
+          const k = (dx ? 1 : 2) * (dy ? 1 : 2);
+          cov += k;
+          r += k * buf[j * 4]; g += k * buf[j * 4 + 1]; b += k * buf[j * 4 + 2];
+        }
+      }
+      if (!cov) continue;
+      const m = mixFraction(src, width, height, x, y, inMine, inBehind);
+      if (m && !m.fits) continue;   // 描线之类，原样留给后层
+      const a = Math.round((m ? m.f : cov / 16) * src[i * 4 + 3]);
+      if (!a) continue;
+      const [cr, cg, cb] = m ? m.color : [r / cov, g / cov, b / cov];
+      out[i * 4] = Math.round(cr);
+      out[i * 4 + 1] = Math.round(cg);
+      out[i * 4 + 2] = Math.round(cb);
+      out[i * 4 + 3] = a;
+    }
+  }
+  return out;
+}
+
+/**
+ * 后层接缝还原：本部件被前层羽化压着的那一圈，颜色换回自己的纯色。
+ *
+ * 源图那格是画师画的过渡 f·前 + (1−f)·后。前层已经按 f 叠了一层自己的颜色，
+ * 后层要是还留着源图原色，拼起来前层颜色算了两遍（边缘发暗/发脏）；
+ * 单独看后层也会带一圈前层的颜色。换成后层内部平均色，叠回去正好等于源图。
+ * 两侧颜色拆不开时不动（前层那边也是按几何羽化的，原色最接近）。
+ *
+ * @param {Uint8Array} mine - 1 = 归本部件
+ * @param {Uint8Array} front - 1 = 归一个更靠前的部件
+ */
+export function unmixBackEdge(buf, width, height, mine, front, src) {
+  const out = Buffer.from(buf);
+  const inMine = (j) => mine[j] === 1;
+  const inFront = (j) => front[j] === 1;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      if (!mine[i]) continue;
+      let touches = false;
+      for (let dy = -1; dy <= 1 && !touches; dy++) for (let dx = -1; dx <= 1; dx++) if (front[i + dy * width + dx]) { touches = true; break; }
+      if (!touches) continue;
+      const m = mixFraction(src, width, height, x, y, inFront, inMine);
+      if (!m || !m.fits || m.f < 0.02) continue;
+      out[i * 4] = m.other[0];
+      out[i * 4 + 1] = m.other[1];
+      out[i * 4 + 2] = m.other[2];
+    }
+  }
+  return out;
+}
+
+/**
+ * 接缝归属修正：前层切口上那一两格，颜色多半是后层的，就还给后层。
+ *
+ * SAM 掩码是像素级 0/1，边缘常常多吃进邻件 1~2px——头发掩码沿着脸多带
+ * 一条肤色。那条肤色在 hair.png 里是一道浅色阶梯（用户报的「锯齿」），
+ * 拼起来时它压在脸上倒看不出，但头发一单独动就露。
+ *
+ * 只把 f < 0.5（后层颜色占多数）的格子改判给后层；改判后后层那格是源图
+ * 原样、全不透明，前层再用 featherFrontEdge 按 f 叠一层过渡——拼起来和
+ * 源图一致，任何一格都有主、不会露底。先算完再统一改，避免一圈圈往里啃。
+ *
+ * @returns {number} 改判的像素数
+ */
+export function refineSeamOwnership(ownerOf, rgba, width, height, depthOf) {
+  const moves = [];
+  const depth = (n) => depthOf.get(n) ?? 0;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      const p = ownerOf[i];
+      if (p === null || rgba[i * 4 + 3] < ALPHA_CUTOFF) continue;
+      let q = null;
+      for (const j of [i - 1, i + 1, i - width, i + width]) {
+        const o = ownerOf[j];
+        if (o !== null && o !== p && depth(o) < depth(p) && rgba[j * 4 + 3] >= ALPHA_CUTOFF) { q = o; break; }
+      }
+      if (q === null) continue;
+      const m = mixFraction(rgba, width, height, x, y, (j) => ownerOf[j] === p, (j) => ownerOf[j] === q);
+      if (m && m.fits && m.f < 0.5) moves.push([i, q]);
+    }
+  }
+  for (const [i, q] of moves) ownerOf[i] = q;
+  return moves.length;
 }
 
 /**

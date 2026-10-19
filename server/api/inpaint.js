@@ -427,6 +427,60 @@ export async function editImage({ apiKey, baseURL, model, imageBuf, maskBuf, pro
 }
 
 /**
+ * 用不透明像素的颜色把透明区**铺满**（只写 RGB，alpha 不动）。
+ *
+ * 和 bleedAlpha 是同一种逐圈扩散（每圈取 8 邻域里已有颜色的均值），
+ * 但不限圈数：送模型的图要摊平成不透明，铺不到的地方就是黑，模型会照着
+ * 补成黑块。按圈推进前沿而不是每圈扫全图——1024² 的图、离轮廓几百像素远的
+ * 角落，全图扫描要几亿次访问。整张没有不透明像素时原样返回。
+ */
+function spreadOwnColor(src, w, h) {
+  const buf = Buffer.from(src);
+  const solid = new Uint8Array(w * h);
+  let front = [];
+  for (let i = 0; i < w * h; i++) if (buf[i * 4 + 3] >= 8) solid[i] = 1;
+  const queued = new Uint8Array(w * h);
+  const enqueueAround = (i, list) => {
+    const x = i % w, y = (i / w) | 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const j = ny * w + nx;
+        if (solid[j] || queued[j]) continue;
+        queued[j] = 1;
+        list.push(j);
+      }
+    }
+  };
+  for (let i = 0; i < w * h; i++) if (solid[i]) enqueueAround(i, front);
+  while (front.length) {
+    // 这一圈全部算完再标成来源，否则颜色会沿处理顺序拖出条纹
+    for (const i of front) {
+      const x = i % w, y = (i / w) | 0;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const j = ny * w + nx;
+          if (!solid[j]) continue;
+          r += buf[j * 4]; g += buf[j * 4 + 1]; b += buf[j * 4 + 2]; n++;
+        }
+      }
+      buf[i * 4] = Math.round(r / n);
+      buf[i * 4 + 1] = Math.round(g / n);
+      buf[i * 4 + 2] = Math.round(b / n);
+    }
+    const next = [];
+    for (const i of front) solid[i] = 1;
+    for (const i of front) enqueueAround(i, next);
+    front = next;
+  }
+  return buf;
+}
+
+/**
  * 补一个部件：把切出来的图里的透明区画上内容。
  *
  * 结果尺寸和原图完全一致——模型输出的分辨率未必对得上，
@@ -453,58 +507,22 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
    */
   const erasedPath = pngPath.replace(/\.png$/, '.erased.png');
   const erasedExists = await sharp(erasedPath).metadata().then(() => true, () => false);
-  let erased = null;
   /*
-   * 真值：被擦那片在源图里原样的 RGB（cutter 顺手写进了 .erased.png 的像素）。
+   * 只读 alpha（掩码语义），RGB 不认。
    *
-   * 有真值就直接贴回去，不让模型补。为什么：被前方部件盖住的那片，模型
-   * 看不到下面是什么，只能照着画面里还看得见的东西推——推出来就是遮挡者
-   * 的一份复制品。实测 body 在裙摆底下补出 [119,113,129]，源图那格是
-   * [108,96,118]（裙摆的紫灰）；head 在镜片底下补出 [246,183,157]，
-   * 源图那格是 [225,173,159]。static 图看不出来（那片被盖着），两片按
-   * 不同骨头转起来就是一层错色的重影——用户报的"断裂滑动"就是这个。
-   *
-   * 源图那个像素不是猜的，它就是当时真正显示的颜色；用户要的
-   * 「完整 Object RGBA」要的正是这一份。
-   *
-   * 判据：alpha=255（在擦除掩码里）且 RGB 非全零（cutter 没真值时留 0）。
+   * 旧版 cutter 往这张图的 RGB 里写过"源图真值"，补完再原样贴回、alpha 给 255。
+   * 那个"真值"是错的：被前方盖住的那格，源图画的是**遮挡者**——披风盖在
+   * 身体上，那格就是披风色。贴回 body，body.png 里就多了一份披风，两片按
+   * 不同骨头转起来一份跟着披风走、一份钉在身体上。实测 kkk：这一步把
+   * 串味率从 17.7% 推到 45.4%，body.erased 的 13 万像素全是别人的颜色。
+   * 旧文件里的 RGB 在这里直接忽略；旧版配套的 .front.png 也不再读。
    */
-  let truth = null;          // Uint8Array(w*h*3)，源图在那里的原样 RGB；null = 没真值
+  let erased = null;
   if (erasedExists) {
     const eb = await sharp(erasedPath).ensureAlpha().raw().toBuffer();
     erased = new Uint8Array(width * height);
-    truth = new Uint8Array(width * height * 3);
     for (let i = 0; i < width * height; i++) {
-      if (eb[i * 4 + 3] <= 127) continue;               // 不在擦除掩码里
-      erased[i] = 1;
-      truth[i * 3] = eb[i * 4];
-      truth[i * 3 + 1] = eb[i * 4 + 1];
-      truth[i * 3 + 2] = eb[i * 4 + 2];
-    }
-    if (!erased.some(Boolean)) truth = null;
-  }
-
-  /*
-   * 前方轮廓掩码（cutter 写的 .front.png）。
-   *
-   * 擦除区里有一部分是**被前方部件整个盖住的**——补图看不到下面是什么，
-   * 只有猜。实测它就照着画面里还看得见的东西画：围裙压在裙子上，裙子的
-   * 擦除区里补出来的全是围裙的紫灰（平均比源图暗 27 个色阶，只有 4.3%
-   * 的像素和源图接近），成了围裙的一份重影。那片 alpha 是 0、预览里看不见，
-   * 但两片按不同骨头转起来就露馅了。
-   *
-   * 所以这片像素：内容照补（模型总得画点什么），但 alpha 一律留 0。
-   * 它被盖住的时候看不见，转开时露出的也是干净的透明，而不是一层重影。
-   * 和"部件自己身上的洞"区分开——那种洞有真值（周围的接缝），该填实。
-   */
-  const frontPath = pngPath.replace(/\.png$/, '.front.png');
-  const frontExists = await sharp(frontPath).metadata().then(() => true, () => false);
-  let front = null;
-  if (frontExists) {
-    const fb = await sharp(frontPath).ensureAlpha().raw().toBuffer();
-    front = new Uint8Array(width * height);
-    for (let i = 0; i < width * height; i++) {
-      front[i] = fb[i * 4] > 127 ? 1 : 0;
+      if (eb[i * 4 + 3] > 127) erased[i] = 1;
     }
   }
 
@@ -585,46 +603,30 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
     : null;
 
   /*
-   * 前方轮廓掩码也按同一比例缩到送模型的尺寸。
+   * 送模型的图：只带本部件自己的像素。
    *
-   * 缩放在这里做一次而不是每帧重算：它是常量，循环里每轮都用同一份输入
-   * （见下面"每轮拿到的都是同一份干净输入"那段）。
+   * 原来这里先把 alpha 全设 255 再扩散——对全不透明的图扩散是空操作，
+   * 透明像素底下存的是什么 RGB，模型就看到什么。旧切图在那儿存着源图原色
+   * （实测 kkk 的 body.png，alpha=0 但源图有内容的像素里 95.9% 是披风、
+   * 上衣的颜色），模型拿到的其实是整张场景裁剪，"补透明区"补的就是照着邻件画。
+   *
+   * 现在先按 alpha 把透明像素的 RGB 丢掉，再用本部件的颜色**铺满**透明区
+   * （不只扩几圈：铺不到的地方是黑，模型会照着补成黑块），最后才摊平成不透明。
    */
-  const frontForApiMasked = front
-    ? await sharp(Buffer.from((() => {
-        const b = Buffer.alloc(width * height * 4);
-        for (let i = 0; i < width * height; i++) {
-          const v = front[i] ? 255 : 0;
-          b[i * 4] = v; b[i * 4 + 1] = v; b[i * 4 + 2] = v; b[i * 4 + 3] = 255;
-        }
-        return b;
-      })()), { raw: { width, height, channels: 4 } })
-        .resize(reqW, reqH, { fit: 'fill' })
-        .raw()
-        .toBuffer({ resolveWithObject: true })
-        .then(({ data }) => {
-          const m = new Uint8Array(reqW * reqH);
-          for (let i = 0; i < reqW * reqH; i++) m[i] = data[i * 4] > 127 ? 1 : 0;
-          return m;
-        })
-    : null;
-
   const imgForApi = await sharp(pngPath)
     .ensureAlpha()
     .resize(reqW, reqH, { fit: 'fill' })
     .raw()
     .toBuffer({ resolveWithObject: true })
     .then(({ data, info }) => {
-      const flat = Buffer.alloc(info.width * info.height * 4);
-      for (let i = 0; i < info.width * info.height; i++) {
-        flat[i * 4] = data[i * 4];
-        flat[i * 4 + 1] = data[i * 4 + 1];
-        flat[i * 4 + 2] = data[i * 4 + 2];
-        flat[i * 4 + 3] = 255;
+      const n = info.width * info.height;
+      const own = Buffer.from(data);
+      for (let i = 0; i < n; i++) {
+        if (own[i * 4 + 3] >= 8) continue;
+        own[i * 4] = 0; own[i * 4 + 1] = 0; own[i * 4 + 2] = 0; own[i * 4 + 3] = 0;
       }
-      // 借用切图那套 alpha 扩散：把不透明像素的颜色推进透明区，
-      // 透明区就有了"周围的颜色"而不是黑
-      const spread = bleedAlpha(flat, info.width, info.height, 8);
+      const spread = spreadOwnColor(own, info.width, info.height);
+      for (let i = 0; i < n; i++) spread[i * 4 + 3] = 255;
 
       /*
        * 擦除区覆盖成醒目的"缺失"纹理。
@@ -641,29 +643,19 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
        * 条纹宽度 10px（按缩放后的尺寸算），太细会糊成一片纯洋红。
        */
       if (erasedForApi) {
-        const { data: em, info: ei } = erasedForApi;
+        const em = erasedForApi.data;
         const STRIPE = 10;
         for (let y = 0; y < info.height; y++) {
           for (let x = 0; x < info.width; x++) {
             const i = y * info.width + x;
             // 掩码经过缩放，边缘会有灰值；>127 当擦除区
             if (em[i * 4] <= 127) continue;
-
-            // front 区已经在掩码里挖掉了，这里也不用盖占位符
-            if (frontForApiMasked && frontForApiMasked[i]) continue;
             const on = (((x + y) / STRIPE) | 0) % 2 === 0;
-            if (on) {
-              spread[i * 4] = 255;
-              spread[i * 4 + 1] = 0;
-              spread[i * 4 + 2] = 255;
-            } else {
-              spread[i * 4] = 255;
-              spread[i * 4 + 1] = 255;
-              spread[i * 4 + 2] = 255;
-            }
+            spread[i * 4] = 255;
+            spread[i * 4 + 1] = on ? 0 : 255;
+            spread[i * 4 + 2] = 255;
           }
         }
-        void ei;
       }
 
       return sharp(spread, { raw: { width: info.width, height: info.height, channels: 4 } })
@@ -671,40 +663,10 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
         .toBuffer();
     });
 
-  /*
-   * 送模型的掩码里，把"没真值"的那片挖掉。
-   *
-   * front 区是被前方部件整个盖住、源图那里本来就空的地方。补图在那儿
-   * 没有真值可参考，只能照着画面里还看得见的东西推——围裙压在裙子上，
-   * 它就把裙子那片照样画了一遍（实测平均比源图暗 27 个色阶，只有 4.3%
-   * 的像素和源图接近）。那块虽然会被压成 alpha=0，可一转动就露出
-   * 一层重影，用户看到的"断裂滑动"就是这么来的。
-   *
-   * 与其让模型去画、再把它压透明（白花一次推理、还留下重影的隐患），
-   * 不如根本不让它补：掩码里去掉这片，模型只补**有真值**的部分。
-   * 落盘时那片保持透明，被盖住的时候看不见，转开时是干净的透明。
-   */
   const maskForApi = await sharp(maskBuf)
     .resize(reqW, reqH, { fit: 'fill' })
-    .raw()
-    .toBuffer({ resolveWithObject: true })
-    .then(async ({ data, info }) => {
-      if (!front) {
-        return sharp(data, { raw: { width: info.width, height: info.height, channels: info.channels } })
-          .png().toBuffer();
-      }
-      const m = Buffer.from(data);
-      const ch = info.channels;
-      for (let i = 0; i < info.width * info.height; i++) {
-        // front 是原尺寸的，按同一比例取样（缩放前就是二值图，取样够用）
-        const sx = Math.min(width - 1, Math.round((i % info.width) * width / info.width));
-        const sy = Math.min(height - 1, Math.round(((i / info.width) | 0) * height / info.height));
-        if (!front[sy * width + sx]) continue;
-        for (let c = 0; c < ch; c++) m[i * ch + c] = 0;
-      }
-      return sharp(m, { raw: { width: info.width, height: info.height, channels: ch } })
-        .png().toBuffer();
-    });
+    .png()
+    .toBuffer();
 
   /*
    * 生成补图 prompt。
@@ -918,27 +880,20 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
     );
 
     /*
-     * 质量分只算**看得见**的那部分像素。
-     *
-     * 被前方部件整个盖住的那片（front）补成什么样都无所谓——它的 alpha
-     * 最后会被压成 0，渲染时根本不显示。可它面积很大（实测 body 那片
-     * 5 万像素，占了 painted 的 70%），模型在那儿画得又是最常见的近白/近黑，
-     * 守卫逐块往回捡，质量分就被这堆看不见的像素顶到 70%，
-     * 明明看得见的部分是好的，却判成"不合格"白重补一轮。
-     *
-     * 所以分子分母都只统计 front 之外的像素。分母为 0（整个擦除区都是
-     * 被盖住的）时直接算合格——没有可见部分要评。
+     * 质量分不再分"可见 / 不可见"：全部擦除区都算，因为**整个擦除区都会
+     * 补成不透明像素**（alpha 255）、进入最终 PNG。以前分"可见"是因为
+     * front（被前方整块盖住的地方）要被留成透明——但 front 那个设计已废弃，
+     * 现在没有"大面积、补成什么样都无所谓"的区域了。所有擦除区该补什么样
+     * 就补成什么样，全部纳入评价。
      */
-    let visiblePainted = 0, visibleGuarded = 0;
+    let painted = 0, guarded = 0;
     for (let i = 0; i < width * height; i++) {
       if (maskRaw.data[i] <= 127) continue;
-      if (front && front[i]) continue;
-      visiblePainted++;
-      if (holeFallback[i]) visibleGuarded++;
+      painted++;
+      if (holeFallback[i]) guarded++;
     }
 
     const out = Buffer.alloc(width * height * 4);
-    let painted = 0;
     for (let i = 0; i < width * height; i++) {
       if (maskRaw.data[i] > 127) {
         // 洞：拿模型的颜色（补砸的孔洞改用四周均色）；
@@ -950,14 +905,9 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
         /*
          * 两种像素的 alpha 处置：
          *   - 外部留白（exterior）：0，轮廓外不凭空长东西。
-         *   - 其余（真正的内部孔洞）：255，缺口就该补上。
-         *
-         * front 区不在这里——它在送模型的掩码里就已经挖掉了（见上面
-         * maskForApi 那段），模型根本没补，maskRaw 在那儿是 0，走的是
-         * 下面「原有内容」那一支，RGB 就是切图填回去的源图真值。
+         *   - 其余（内部孔洞、擦除区）：255，缺口就该补上。
          */
         out[i * 4 + 3] = exterior[i] ? 0 : 255;
-        painted++;
       } else {
         // 原有内容：一个字节都不动
         out[i * 4] = base.data[i * 4];
@@ -979,55 +929,13 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
      */
     const finalBuf = bleedAlpha(out, width, height, 2);
 
-    /*
-     * 有真值的那片：把源图原样的颜色贴回去，覆盖模型在这片画的东西。
-     *
-     * 放在 bleedAlpha **之后**：扩散只写 RGB、不动 alpha，会把周围的颜色
-     * 渗进这片，把真值搅脏。贴回是最后一步，写完就是最终像素。
-     *
-     * 放在选轮次**之后**：质量分只该看模型真正发挥的部分（可见区），
-     * 被盖住那片既由真值决定，就不该参与评判。
-     *
-     * alpha 给 255 而不是留 0：用户要的是「隐藏区域(AI补全/Inpaint) →
-     * 完整 Object RGBA」——围裙甩开的时候底下得有身体，留 0 就是个洞。
-     * 跟着 body 骨头动的那块，画的是当时真正显示的颜色，接缝天然对得上。
-     */
-    if (truth) {
-      let truthPainted = 0;
-      for (let i = 0; i < width * height; i++) {
-        if (!erased[i]) continue;
-        const t = truth[i * 3], tg = truth[i * 3 + 1], tb = truth[i * 3 + 2];
-        /*
-         * 全零 = cutter 在那里没有真值（源图本来是空的，实测两件素材合计
-         * 412px）。那种才留给模型补，不贴。
-         */
-        if (!t && !tg && !tb) continue;
-        finalBuf[i * 4] = t;
-        finalBuf[i * 4 + 1] = tg;
-        finalBuf[i * 4 + 2] = tb;
-        finalBuf[i * 4 + 3] = 255;
-        truthPainted++;
-      }
-      if (truthPainted) {
-        console.log(`[补图] ⧉ ${partName ?? ''} 被前方盖住的 ${truthPainted}px 用源图真值贴回（不让模型编）`);
-      }
-    }
-
-    // 守卫救回来的比例就是这一轮的质量分，越低越好（只算可见像素）
-    const gFrac = visiblePainted > 0 ? visibleGuarded / visiblePainted : 0;
-    /*
-     * 选"最好的一轮"按**可见**质量分，不按绝对像素数。
-     *
-     * 按像素数选会被大面积、看不见的 front 区带偏：第 1 轮可见部分完美
-     * 但 front 区画砸了 5 万像素，第 2 轮可见部分差一点但 front 区画得好，
-     * 就会选中第 2 轮——而用户看到的正是可见部分。
-     */
-    const gFracForPick = visiblePainted > 0 ? visibleGuarded / visiblePainted : 0;
-    if (gFracForPick < bestFrac || bestFinalBuf === null) {
+    // 守卫救回来的比例就是这一轮的质量分，越低越好；按比例选，不按绝对像素数
+    const gFrac = painted > 0 ? guarded / painted : 0;
+    if (gFrac < bestFrac || bestFinalBuf === null) {
       bestFinalBuf = finalBuf;
-      bestFrac = gFracForPick;
-      bestGuarded = visibleGuarded;
-      bestPainted = visiblePainted;
+      bestFrac = gFrac;
+      bestGuarded = guarded;
+      bestPainted = painted;
       bestChk = chkCleared;
       bestAttempt = qAttempt;
     }
@@ -1041,7 +949,7 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
 
     if (qAttempt < qMax) {
       console.log(
-        `[补图] ↻ ${partName ?? ''} 第 ${qAttempt} 轮不合格（守卫救回 ${visibleGuarded}/${visiblePainted}px = ` +
+        `[补图] ↻ ${partName ?? ''} 第 ${qAttempt} 轮不合格（守卫救回 ${guarded}/${painted}px = ` +
         `${(gFrac * 100).toFixed(1)}% > ${(GUARD_OK_FRAC * 100).toFixed(0)}%），重补`
       );
     } else {
@@ -1061,18 +969,6 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
   const painted = bestPainted;
   const chkCleared = bestChk;
   const guardedCount = bestGuarded;
-
-  /*
-   * 有真值的那片：把源图原样的颜色贴回去，覆盖模型在这片画的东西。
-   *
-   * 放在选轮次**之后**：质量分和轮次选择只该看模型真正发挥的部分（可见区），
-   * 被盖住那片既然由真值决定，就不该参与评判。
-   *
-   * alpha 给 255 而不是留 0：用户要的是「隐藏区域(AI补全/Inpaint) →
-   * 完整 Object RGBA」——围裙甩开的时候底下得有身体，留 0 就是个洞。
-   * 会跟着 body 骨头动的那块，现在画的是当时真正显示的颜色，接缝天然对得上。
-   */
-
 
   await sharp(finalBuf, { raw: { width, height, channels: 4 } }).png().toFile(pngPath);
 
