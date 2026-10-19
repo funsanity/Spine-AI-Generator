@@ -13,6 +13,38 @@
  * 渲染时把 Spine 坐标再翻回屏幕坐标，所以看到的方向和原图一致。
  */
 
+/** 无父骨骼时的世界变换：原点、单位矩阵 */
+const IDENTITY = Object.freeze({ x: 0, y: 0, a: 1, b: 0, c: 0, d: 1, rot: 0 });
+
+/**
+ * 骨骼世界变换 = 父矩阵 × 局部（平移、旋转、缩放），和 Spine 默认的继承方式一致。
+ *   worldX = a·lx + b·ly + x，worldY = c·lx + d·ly + y
+ *
+ * 以前只存了一个累加角度 rot，缩放轨道读不进来；整体呼吸要靠 root 的纵向缩放
+ * 做（所有部件同一个变换，接缝两侧位移相同，不裂），所以改成整块矩阵。
+ * rot 照旧给出来，骨骼叠加层和对齐诊断还在用。
+ */
+function composeBone(parent, lx, ly, rotDeg, sx, sy) {
+  const r = (rotDeg * Math.PI) / 180;
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  const la = cos * sx;
+  const lb = -sin * sy;
+  const lc = sin * sx;
+  const ld = cos * sy;
+  const p = parent ?? IDENTITY;
+  const a = p.a * la + p.b * lc;
+  const b = p.a * lb + p.b * ld;
+  const c = p.c * la + p.d * lc;
+  const d = p.c * lb + p.d * ld;
+  return {
+    x: p.x + p.a * lx + p.b * ly,
+    y: p.y + p.c * lx + p.d * ly,
+    a, b, c, d,
+    rot: (Math.atan2(c, a) * 180) / Math.PI
+  };
+}
+
 export class SpinePreview {
   constructor(canvas) {
     this.canvas = canvas;
@@ -306,20 +338,11 @@ export class SpinePreview {
     const resolve = (name, guard = 0) => {
       if (world.has(name)) return world.get(name);
       const bone = byName.get(name);
-      if (!bone || guard > bones.length) return { x: 0, y: 0, rot: 0 };
+      if (!bone || guard > bones.length) return IDENTITY;
 
-      const parent = bone.parent ? resolve(bone.parent, guard + 1) : { x: 0, y: 0, rot: 0 };
-      const rad = (parent.rot * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
-      const lx = bone.x ?? 0;
-      const ly = bone.y ?? 0;
-
-      const w = {
-        x: parent.x + lx * cos - ly * sin,
-        y: parent.y + lx * sin + ly * cos,
-        rot: parent.rot + (bone.rotation ?? bone.rot ?? 0)
-      };
+      const parent = bone.parent ? resolve(bone.parent, guard + 1) : null;
+      const w = composeBone(parent, bone.x ?? 0, bone.y ?? 0, bone.rotation ?? bone.rot ?? 0,
+        bone.scaleX ?? 1, bone.scaleY ?? 1);
       world.set(name, w);
       return w;
     };
@@ -353,7 +376,7 @@ export class SpinePreview {
   /** 取出某个骨骼在某个时刻的变换 */
   boneTransform(boneName) {
     const track = this.animation?.bones?.[boneName];
-    if (!track) return { tx: 0, ty: 0, rotate: 0 };
+    if (!track) return { tx: 0, ty: 0, rotate: 0, sx: 1, sy: 1 };
 
     const tl = track.translate?.map((k) => ({ time: k.time, value: k.x ?? 0, curve: k.curve }));
     const ty = track.translate?.map((k) => ({ time: k.time, value: k.y ?? 0, curve: k.curve }));
@@ -364,13 +387,19 @@ export class SpinePreview {
       curve: k.curve
     }));
 
+    // scale 关键帧是乘在静止缩放上的倍数，缺省 1
+    const scx = track.scale?.map((k) => ({ time: k.time, value: k.x ?? 1, curve: k.curve }));
+    const scy = track.scale?.map((k) => ({ time: k.time, value: k.y ?? 1, curve: k.curve }));
+
     // translate 是相对静止姿势的偏移，直接用。
     // 之前减去 bone.x/bone.y 是在抵消生成端误写的绝对坐标；
     // 生成端已改成偏移量，这里再减一次就会把角色推出画面。
     return {
       tx: tl?.length ? SpinePreview.sample(tl, this.time) : 0,
       ty: ty?.length ? SpinePreview.sample(ty, this.time) : 0,
-      rotate: rot?.length ? SpinePreview.sample(rot, this.time) : 0
+      rotate: rot?.length ? SpinePreview.sample(rot, this.time) : 0,
+      sx: scx?.length ? SpinePreview.sample(scx, this.time) : 1,
+      sy: scy?.length ? SpinePreview.sample(scy, this.time) : 1
     };
   }
 
@@ -415,24 +444,15 @@ export class SpinePreview {
     const world = new Map();
     for (const bone of skeleton.bones) {
       const t = this.boneTransform(bone.name);
-      const parent = bone.parent ? world.get(bone.parent) : null;
-
-      const lx = (bone.x ?? 0) + t.tx;
-      const ly = (bone.y ?? 0) + t.ty;
-
-      if (!parent) {
-        world.set(bone.name, { x: lx, y: ly, rot: t.rotate });
-      } else {
-        const rad = (parent.rot * Math.PI) / 180;
-        const cos = Math.cos(rad);
-        const sin = Math.sin(rad);
-
-        world.set(bone.name, {
-          x: parent.x + lx * cos - ly * sin,
-          y: parent.y + lx * sin + ly * cos,
-          rot: parent.rot + t.rotate
-        });
-      }
+      const parent = bone.parent ? world.get(bone.parent) ?? null : null;
+      world.set(bone.name, composeBone(
+        parent,
+        (bone.x ?? 0) + t.tx,
+        (bone.y ?? 0) + t.ty,
+        (bone.rotation ?? bone.rot ?? 0) + t.rotate,
+        (bone.scaleX ?? 1) * t.sx,
+        (bone.scaleY ?? 1) * t.sy
+      ));
     }
 
     // Spine 坐标（Y 向上）→ 屏幕坐标（Y 向下）
@@ -457,19 +477,14 @@ export class SpinePreview {
       const oy = attachment?.y ?? 0;
 
       // attachment 原点在图片中心，偏移相对骨骼原点（Spine 单位，未缩放）
-      const rad = (bone.rot * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
-
-      const worldX = bone.x + (ox * cos - oy * sin);
-      const worldY = bone.y + (ox * sin + oy * cos);
+      const worldX = bone.x + bone.a * ox + bone.b * oy;
+      const worldY = bone.y + bone.c * ox + bone.d * oy;
       const screen = toScreen(worldX, worldY);
 
+      // 图片坐标 (u 向右, v 向下) → 骨骼局部 (u, -v) → 世界 → 屏幕（Y 再翻一次）。
+      // 直接给整块矩阵，旋转和缩放（含父级的非等比缩放）一次到位
       ctx.save();
-      ctx.translate(screen.x, screen.y);
-      // Spine 的旋转是逆时针为正，屏幕坐标 Y 向下，所以要取反
-      ctx.rotate((-bone.rot * Math.PI) / 180);
-      ctx.scale(scale, scale);
+      ctx.transform(scale * bone.a, -scale * bone.c, -scale * bone.b, scale * bone.d, screen.x, screen.y);
       ctx.drawImage(img, -img.width / 2, -img.height / 2, img.width, img.height);
       ctx.restore();
     }
@@ -613,10 +628,7 @@ export class SpinePreview {
     }
 
     // 附件顶点是相对「所属槽位骨骼」原点存的，先要能还原到世界静止位置
-    const restSlot = restWorld.get(slot.bone) ?? { x: 0, y: 0, rot: 0 };
-    const slotRad = (restSlot.rot * Math.PI) / 180;
-    const slotCos = Math.cos(slotRad);
-    const slotSin = Math.sin(slotRad);
+    const restSlot = restWorld.get(slot.bone) ?? IDENTITY;
 
     // 算出每个顶点蒙皮后的世界坐标。
     //
@@ -632,8 +644,8 @@ export class SpinePreview {
       const vx = verts[v * 2] + offX;
       const vy = verts[v * 2 + 1] + offY;
       // 顶点的静止世界坐标
-      const restX = restSlot.x + vx * slotCos - vy * slotSin;
-      const restY = restSlot.y + vx * slotSin + vy * slotCos;
+      const restX = restSlot.x + restSlot.a * vx + restSlot.b * vy;
+      const restY = restSlot.y + restSlot.c * vx + restSlot.d * vy;
       const boneNames = attachment.bones[v];
       const weights = attachment.weights[v];
 
@@ -647,22 +659,18 @@ export class SpinePreview {
         const d = boneDelta.get(boneNames[i]);
         if (!d) continue;
 
-        // 顶点在这根骨骼静止空间下的坐标
-        const rr = (-(d.rest.rot ?? 0) * Math.PI) / 180;
-        const rcos = Math.cos(rr);
-        const rsin = Math.sin(rr);
-        const dx = restX - d.rest.x;
-        const dy = restY - d.rest.y;
-        const bx = dx * rcos - dy * rsin;
-        const by = dx * rsin + dy * rcos;
+        // 顶点在这根骨骼静止空间下的坐标（静止矩阵求逆）
+        const r = d.rest;
+        const det = r.a * r.d - r.b * r.c || 1;
+        const dx = restX - r.x;
+        const dy = restY - r.y;
+        const bx = (r.d * dx - r.b * dy) / det;
+        const by = (-r.c * dx + r.a * dy) / det;
 
         // 再套上这根骨骼的当前世界变换
-        const cr = ((d.cur.rot ?? 0) * Math.PI) / 180;
-        const ccos = Math.cos(cr);
-        const csin = Math.sin(cr);
-
-        wx += w * (d.cur.x + bx * ccos - by * csin);
-        wy += w * (d.cur.y + bx * csin + by * ccos);
+        const c = d.cur;
+        wx += w * (c.x + c.a * bx + c.b * by);
+        wy += w * (c.y + c.c * bx + c.d * by);
       }
 
       const sp = toScreen(wx, wy);

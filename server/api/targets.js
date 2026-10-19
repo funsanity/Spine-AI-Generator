@@ -196,8 +196,9 @@ function toSpineRegion(att) {
  *   1. 旋转关键帧的值字段：3.8 叫 angle，4.x 叫 value
  *   2. curve: 'smooth' 不是合法取值——Spine 只认 'stepped' 或贝塞尔控制点。
  *      写进去的后果是运行时解析报错或整条曲线被丢掉。
- *      这里直接去掉 curve 走线性：生成的动画幅度都在 6px / 5° 以内，
- *      线性和缓入缓出肉眼分不出，但能保证一定加载得上。
+ *      这里直接去掉 curve 走线性：生成的 idle 每 1/8 秒一帧，起伏 28px（root 纵向缩放）/
+ *      旋转 2° 以内，帧间线性插值和真曲线差不到 0.1px，肉眼分不出，
+ *      但能保证一定加载得上。
  *      浏览器预览仍然读 'smooth' 做平滑，两边互不影响。
  */
 function convertAnimations(animations, rotateKey) {
@@ -227,8 +228,9 @@ function convertAnimations(animations, rotateKey) {
       if (track.scale?.length) {
         converted.scale = track.scale.map((k) => ({
           time: +(k.time ?? 0).toFixed(4),
-          x: +(k.x ?? 1).toFixed(4),
-          y: +(k.y ?? 1).toFixed(4)
+          // 5 位：root 缩放乘的是整个角色高（~1500px），4 位会让鞋底抖 0.07px
+          x: +(k.x ?? 1).toFixed(5),
+          y: +(k.y ?? 1).toFixed(5)
         }));
       }
 

@@ -104,12 +104,12 @@ Stage 3: Skeleton
    │  ├─ Bone: topological order + one synthetic root
    │  │     (the Spine editor accepts exactly one root)
    │  ├─ Mesh: grid triangulation + annulus stitching
-   │  ├─ Weight: seams share weights across both sides, ≤ 4 bones per vertex
+   │  ├─ Weight: seam vertices follow the parent bone fully, handing over to the own bone toward the tip; ≤ 4 bones per vertex
    │  ├─ Pivot → bone origin; pixel coords → Spine coords (centred, Y flipped)
    │  └─ Slots sorted by depth = draw order
    ▼
 Stage 4: Animation + export
-   │  ├─ generate idle (amplitude capped at 1.5°; rotate more and seams show)
+   │  ├─ generate idle (standing breath: the whole character stretches ~1.3% vertically, anchored at the soles; every part shares one transform so seams never open; only the head sways 0.6°)
    │  ├─ convert for the target platform: Cocos / Unity / Spine 4.0–4.2
    │  │     version differences: 3.8 uses angle, 4.0+ uses value;
    │  │     skins is an object in 3.8 and an array in 4.x

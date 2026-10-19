@@ -9,18 +9,39 @@
  *
  * 权重怎么来的：
  *   刚性拼合的问题不是"部件不动"，而是接缝两侧属于不同骨骼、
- *   旋转时错开。这里让靠近父级关节的顶点更多跟随父骨骼，
- *   远离关节的顶点完全跟随自身骨骼，接缝就被"拉"在一起。
+ *   动起来时错开。接缝要合得上，接缝上的顶点就得**完全**跟父骨骼走，
+ *   往末梢方向再渐渐交还给自身骨骼：
+ *     d       = 顶点沿「关节 → 部件中心」方向离关节多远（投影，不是直线距离）
+ *     wParent = 1 - smoothstep(S, S + R, d)
+ *   S、R 分别是部件沿这个方向长度的 SOLID_SPAN、BLEND_SPAN
+ *   关节就是 pivot（AI 给的转轴，本来就落在和父件的连接处）。
  *
- *   权重用距离比而非绝对距离：
- *     wParent = clamp(1 - d / (d + dParent), 0, 0.5)
- *   d 是顶点到自身骨骼原点的距离，dParent 是到父级关节的距离。
- *   这样不同尺寸的部件不用调参数，且权重上限压到 0.5，
- *   保证自身骨骼始终是主导影响，不会出现"零件被父级拽走"。
+ *   之前是 wParent = 0.5 × (1 - dJoint / (dSelf + dJoint))，有两处毛病，
+ *   idle 呼吸一跑就露裂缝（kkk 实测静止是实的、动起来成洞的像素 1298px）：
+ *     - 封顶 0.5：上身起伏 19px，大腿顶边只跟上一半，裙摆下面裂开一道横缝；
+ *       手臂转 1.8°，肩膀接缝只合上一半。
+ *     - 远端不归零：大腿下摆离关节最远的点父权重还有 ~0.25，跟着上身漂几像素，
+ *       可下面的靴子是钉住的，膝盖处又裂一道。
+ *   用投影距离而不是直线距离：大腿顶边整条线都是 d=0，两个角不会比中间松。
  */
 
 /** Spine 最多支持 4 个骨骼影响一个顶点，这里只用到 2 个 */
 const MAX_INFLUENCES = 4;
+
+/**
+ * 父骨骼影响从关节往末梢铺多远（占部件沿关节方向长度的比例）。
+ * 太小：交接带窄，子件一转，交接处的三角被拧得很厉害；
+ * 太大：子件自己的转动被父骨骼吃掉一大半，手臂摆不起来。
+ */
+const BLEND_SPAN = 0.4;
+
+/**
+ * 关节往外这一段（同样按部件长度的比例）完全跟父骨骼走，再往外才开始过渡。
+ * 接缝不总是一条贴着 pivot 的直线：护膝斜盖在大腿下摆上、袖口斜着搭在披风上，
+ * 交界线离 pivot 能有几十像素。交界处父权重哪怕只差 5%，上身起伏 19px
+ * 就是 1px 的缝（kkk 膝盖实测）。
+ */
+const SOLID_SPAN = 0.2;
 
 /**
  * 为一个部件构建网格顶点与权重。
@@ -42,7 +63,8 @@ export function buildSkinnedMesh(part, parentPart, opts = {}) {
 
   // 关节位置：与父部件的接触点。用父部件中心到本部件中心的连线，
   // 与本部件边界的交点作为关节，比"父部件中心"更贴近真实的连接处。
-  const joint = parentPart ? estimateJoint(part, parentPart) : null;
+  const pivot0 = part.pivot ?? { x: bb.width / 2, y: bb.height / 2 };
+  const joint = parentPart ? jointFrame(part, parentPart, pivot0) : null;
 
   // 顶点采样：外轮廓一圈 + 内部网格。
   // 只在边界采样会导致中心区域无顶点、旋转时整块板结；
@@ -64,7 +86,7 @@ export function buildSkinnedMesh(part, parentPart, opts = {}) {
     vertices.push(p.x, -p.y);
     // UV 原点在图片左上角，Y 向下，和顶点坐标的翻转无关
     uvs.push(p.x / bb.width, p.y / bb.height);
-    weights.push(computeWeight(p, joint, pivot));
+    weights.push(computeWeight(p, joint));
   }
 
   const triangles = triangulate(points, outer.length, innerSteps);
@@ -119,37 +141,71 @@ function estimateJoint(part, parentPart) {
 }
 
 /**
+ * 关节坐标系：原点 + 指向末梢的单位方向 + 沿这个方向的混合长度 R（bbox 局部坐标）。
+ *
+ * 原点优先用 pivot：AI 标的转轴就是和父件的连接处（大腿在顶边、头在脖子、
+ * 手臂在肩膀）。pivot 落在部件正中时它说明不了连接在哪一侧，
+ * 退回两个包围盒中心连线和本部件边界的交点。
+ */
+function jointFrame(part, parentPart, pivot) {
+  const bb = part.bbox;
+  const c = { x: bb.width / 2, y: bb.height / 2 };
+  const diag = Math.hypot(bb.width, bb.height);
+  let origin = pivot;
+  if (Math.hypot(c.x - pivot.x, c.y - pivot.y) < diag * 0.08) origin = estimateJoint(part, parentPart);
+  let dx = c.x - origin.x;
+  let dy = c.y - origin.y;
+  let len = Math.hypot(dx, dy);
+  if (len < 1e-6) {
+    // 关节就在正中，没有方向可言：整块平分给父子
+    return { x: origin.x, y: origin.y, dir: null, solid: 0, span: 0 };
+  }
+  dx /= len;
+  dy /= len;
+  // 部件沿这个方向从关节到最远角的长度
+  let far = 0;
+  for (const [px, py] of [[0, 0], [bb.width, 0], [bb.width, bb.height], [0, bb.height]]) {
+    far = Math.max(far, (px - origin.x) * dx + (py - origin.y) * dy);
+  }
+  return {
+    x: origin.x,
+    y: origin.y,
+    dir: { x: dx, y: dy },
+    solid: far * SOLID_SPAN,
+    span: Math.max(1, far * BLEND_SPAN)
+  };
+}
+
+/**
  * 计算单个顶点的权重。
  * @param {object} point - bbox 局部坐标（左上原点）
- * @param {object|null} joint - 关节位置（bbox 局部坐标）
- * @param {object} pivot - 骨骼原点（bbox 局部坐标）
+ * @param {object|null} joint - jointFrame 的结果
  * @returns {Array<{boneIndex:number, weight:number}>} boneIndex 0 = 父骨骼，1 = 自身骨骼
  */
-function computeWeight(point, joint, pivot) {
+function computeWeight(point, joint) {
   if (!joint) {
     // 根部件没有父级，完全由自身骨骼驱动
     return [{ boneIndex: 0, weight: 1 }];
   }
 
-  // 顶点到自身骨骼原点的距离
-  const dSelf = Math.hypot(point.x - pivot.x, point.y - pivot.y);
-  // 顶点到关节的距离
-  const dJoint = Math.hypot(point.x - joint.x, point.y - joint.y);
-
-  const total = dSelf + dJoint;
-  if (total < 1e-6) return [{ boneIndex: 0, weight: 1 }];
-
-  // 离关节越近，父骨骼影响越大；上限 0.5 保证自身骨骼始终主导
-  let wParent = 0.5 * (1 - dJoint / total);
-  wParent = Math.max(0, Math.min(0.5, wParent));
-
-  if (wParent < 0.001) {
-    return [{ boneIndex: 0, weight: 1 }];
+  let wParent;
+  if (!joint.dir) {
+    wParent = 0.5;
+  } else {
+    // 关节背后（d < 0）的顶点也全归父级：那一截本来就压在父件底下
+    const d = (point.x - joint.x) * joint.dir.x + (point.y - joint.y) * joint.dir.y;
+    const t = Math.max(0, Math.min(1, (d - joint.solid) / joint.span));
+    wParent = 1 - t * t * (3 - 2 * t);
   }
 
+  // 只剩一条影响时 boneIndex 0 就是「唯一那条」：父级全占写父骨骼，否则写自身
+  if (wParent > 0.999) return [{ boneIndex: 0, weight: 1 }];
+  if (wParent < 0.001) return [{ boneIndex: 1, weight: 1 }];
+
+  const wp = +wParent.toFixed(4);
   return [
-    { boneIndex: 0, weight: +(wParent).toFixed(4) },
-    { boneIndex: 1, weight: +(1 - wParent).toFixed(4) }
+    { boneIndex: 0, weight: wp },
+    { boneIndex: 1, weight: +(1 - wp).toFixed(4) }
   ];
 }
 

@@ -261,10 +261,41 @@ function computeBounds(analysis, imageSize) {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
+/** 底板部件名，与 baseplate.js 的 BASE_PLATE_NAME 一致（那边引了 sharp，不为一个常量拉进来） */
+const BASE_PLATE = '_base_plate';
+
+/**
+ * 名字像腿脚的部件。AI 部件表的命名不受约束，常见的是英文蛇形
+ * （thigh_l / shin_boot_left / foot_r），偶尔是中文。
+ * hip / pelvis 故意不算：它们是大腿的父级，属于上身，要跟着起伏。
+ */
+const LEG_RE = /thigh|shin|leg|calf|knee|ankle|foot|feet|boot|shoe|sock|stocking|sandal|sneaker|toe|pants|trouser|腿|脚|足|靴|鞋|袜|膝|裤/i;
+
+/** 一次呼吸的时长（秒）。再快像在喘，再慢看不出在动 */
+const BREATH_PERIOD = 3;
+
+/** 每个周期的采样数：每秒 8 帧，起伏 20px 时线性插值和真曲线差不到 0.1px */
+const BREATH_STEPS = 24;
+
+/** 头左右晃的幅度（度）。脖子那条缝后面有躯干垫着，这个幅度不露缝 */
+const HEAD_SWAY_DEG = 0.6;
+
+/** 头顶起伏 = 角色高度 × 这个比例，再夹到 [4, 28]px。kkk（高 1482px）是 19px */
+const BREATH_RISE_RATIO = 0.013;
+
 /**
  * 为骨架生成基础动画。
  *
- * 只产出 idle：整体轻微上下浮动 + 各部件错相位的小幅旋转，看起来像呼吸。
+ * 只产出 idle：站立呼吸。整个角色以鞋底为锚纵向微微拉伸（头顶抬起约身高的
+ * 1.3%），鞋底不动；头和头发慢半拍轻轻晃。
+ *
+ * 之前的写法是 root 整体上下浮动 + 所有子部件错相位小幅旋转，看着是脚在摆：
+ *   - root 一动，脚跟着离地；
+ *   - 大腿、小腿也在转，转轴在胯和膝，靴子就一直前后晃。
+ * 现在：
+ *   - 起伏是 root 的纵向缩放 + 补偿平移，锚点在地面，鞋底纹丝不动；
+ *     所有部件同一个变换，接缝两侧位移一致，不会裂（见函数里的说明）；
+ *   - 腿和腿的祖先都不转。
  *
  * 之前还会多产一个 wave（部件依次摆动），那是开发期用来肉眼确认父子层级和
  * pivot 的调试动画，不是能上线的东西，而且每根骨骼多一份用不上的关键帧。
@@ -277,47 +308,126 @@ export function generateAnimations(skeleton) {
   if (!bones.length) return skeleton;
 
   const root = bones.find((b) => !b.parent) ?? bones[0];
-  /*
-   * 顶层部件（root 的直接子级）不单独给旋转轨道。
-   *
-   * 它们是角色主体和底板这一类东西，转它们等于把整个角色/整块底板转过去，
-   * 拼合式切图的接缝会立刻露出来。整体起伏交给下面 root 的 translate，
-   * 真正该摆动的是再往下的子部件。
-   */
-  const children = bones.filter((b) => b.parent && b.parent !== root.name);
+  const byName = new Map(bones.map((b) => [b.name, b]));
+  const parentOf = (b) => (b?.parent ? byName.get(b.parent) : null);
+  const isTop = (b) => b.parent === root.name;
+  const skip = (b) => b === root || b.name === BASE_PLATE;
+  // 代数：顶层部件的子级是 1，孙级是 2……
+  const genOf = (b) => {
+    let g = 0;
+    for (let cur = b; cur && !isTop(cur) && cur !== root && g < bones.length; cur = parentOf(cur)) g++;
+    return g;
+  };
 
   // 旋转关键帧的键名按版本走：3.8 是 angle，4.0 起改成 value。
   // 用错的话运行时读到 undefined，动画静止不动。
   const spine = skeleton.skeleton?.spine ?? '4.0';
   const rotKey = spine.startsWith('3.') ? 'angle' : 'value';
-  const rot = (time, angle) => ({ time: +time.toFixed(3), [rotKey]: +angle.toFixed(3) });
+
+  const skins = skeleton.skins;
+  const atts = (Array.isArray(skins) ? skins[0]?.attachments : skins?.default) ?? {};
+  const attOf = (b) => (b ? atts[`${b.name}_slot`]?.[b.name] ?? null : null);
+
+  // 静止姿势的世界坐标。生成的骨架静止旋转全为 0，父子累加就是纯加法；
+  // bones 已是父在前的拓扑序，一遍就能算完。
+  const world = new Map();
+  for (const b of bones) {
+    const p = world.get(b.parent) ?? { x: 0, y: 0 };
+    world.set(b.name, { x: p.x + (b.x ?? 0), y: p.y + (b.y ?? 0) });
+  }
+
+  // 每个部件的上下边（Spine 坐标，Y 向上），用来量角色高度、找哪些部件着地
+  const extent = new Map();
+  for (const b of bones) {
+    if (skip(b)) continue;
+    const e = extentOf(attOf(b), world.get(b.name));
+    if (e) extent.set(b.name, e);
+  }
+  const exts = [...extent.values()];
+  const ground = exts.length ? Math.min(...exts.map((e) => e.bottom)) : 0;
+  const height = exts.length ? Math.max(...exts.map((e) => e.top)) - ground : 0;
+  const touchesGround = (b) => (extent.get(b.name)?.bottom ?? Infinity) <= ground + height * 0.03;
+  // 几何上的脚：底边贴地，整块又都在下半身。名字认不出时靠这条兜住
+  const footish = (b) => touchesGround(b) && extent.get(b.name).top < ground + height / 2;
+
+  /*
+   * 腿：名字像腿脚的、几何上是脚的，以及挂在它们下面的东西（鞋带、护踝……）。
+   * 腿和腿的祖先（顶层部件之下）一律不转：转轴在胯和膝，一转靴子就前后晃。
+   */
+  const legs = new Set();
+  for (const b of bones) {
+    if (skip(b) || isTop(b)) continue;
+    if (LEG_RE.test(b.name) || footish(b) || legs.has(b.parent)) legs.add(b.name);
+  }
+  const noRotate = new Set(legs);
+  for (const name of legs) {
+    for (let cur = parentOf(byName.get(name)), n = 0; cur && !isTop(cur) && !skip(cur) && n < bones.length; n++, cur = parentOf(cur)) {
+      noRotate.add(cur.name);
+    }
+  }
+
+  const rise = height > 0 ? Math.min(28, Math.max(4, Math.round(height * BREATH_RISE_RATIO))) : 4;
+  // 纵向拉伸量：头顶抬 rise 像素
+  const stretch = height > 0 ? rise / height : 0;
+
+  // 0 → 1 → 0 的一口气，t=0 落在静止姿势上
+  const breath = (u) => (1 - Math.cos(u * Math.PI * 2)) / 2;
+  const track = (fn) => sine(BREATH_PERIOD, BREATH_STEPS, fn);
 
   // 曲线一律不写，走默认线性插值。
   // 之前写的 curve: 'smooth' 不是 Spine 的合法值（只认 'stepped' 或贝塞尔
-  // 控制点），运行时解析会出问题。平滑感靠加密关键帧来给，见下面的正弦采样。
+  // 控制点），运行时解析会出问题。平滑感靠加密关键帧来给。
   const idle = { bones: {} };
 
-  // translate 是「相对静止姿势的偏移」，不是绝对坐标。
-  // 之前写成 root.x / root.y，运行时会把骨骼自身位置再叠一遍，
-  // 整个角色按自己的坐标平移出画面——这也是预览里图看着不全的原因之一。
-  idle.bones[root.name] = {
-    translate: sine(3, 8, (t) => ({ x: 0, y: Math.sin(t * Math.PI * 2) * 3 + 3 }))
-  };
+  /*
+   * 呼吸 = root 以鞋底为锚做纵向缩放：scaleY 1 → 1 + stretch，
+   * 同时 root 往上平移 -ground·stretch，把地面那条线拉回原处。
+   *   世界 y = T + scaleY·y局部，地面 y=ground 处：T + (1+k)·ground = ground → T = -k·ground
+   *
+   * 为什么不再是「上身平移 + 腿反向平移」：拼合式切图的部件之间没有重叠，
+   * 两侧位移只要不一样，接缝就张开。上一版把起伏压在某一节腿的网格上，
+   * 每个部件按自己的形状算权重，护膝和大腿下摆的交界两边一个跟 40%、一个跟 0%，
+   * kkk 实测膝盖张开 4.2px（换成拉大腿，裂缝挪到裙摆下沿，5.6px）。
+   * 整体缩放是同一个仿射变换，所有部件、所有接缝位移一致，从根上不裂。
+   * 代价是靴子也跟着拉长 stretch（kkk 1.3%，靴筒 500px 长 6px），鞋底不动。
+   *
+   * translate 是「相对静止姿势的偏移」，不是绝对坐标。
+   * 之前写成 root.x / root.y，运行时会把骨骼自身位置再叠一遍，
+   * 整个角色按自己的坐标平移出画面——这也是预览里图看着不全的原因之一。
+   */
+  if (stretch > 0) {
+    idle.bones[root.name] = {
+      scale: track((u) => ({ x: 1, y: +(1 + stretch * breath(u)).toFixed(5) })),
+      translate: track((u) => ({ x: 0, y: +(-ground * stretch * breath(u)).toFixed(3) }))
+    };
+  }
 
-  // 子部件按深度错开相位，避免所有部件同步摆动显得僵硬。
-  // 幅度压到 1.5° 以内：拼合式的切图一旦旋转，接缝会立刻暴露出来。
-  children.forEach((bone, i) => {
-    const phase = (i / Math.max(children.length, 1)) * 2;
-    const amp = 0.6 + (i % 3) * 0.3;
-
-    const keys = [];
-    const steps = 12;
-    for (let s = 0; s <= steps; s++) {
-      const time = (s / steps) * 3;
-      keys.push(rot(time, Math.sin(((time + phase) / 3) * Math.PI * 2) * amp));
-    }
-    idle.bones[bone.name] = { rotate: keys };
-  });
+  /*
+   * 只有居中、整块在腿上方、直接挂在顶层部件上的子部件（头）慢半拍轻轻左右晃，
+   * 它下面的（头发、眼镜……）跟着它整体走，自己不再转：头发再单独晃，
+   * 发际线那条接缝两侧就有了相对转动（kkk 实测张开 2.8px，后面没有垫底）。
+   *
+   * 两侧的（手臂、偏在一边的披风，|x| ≥ 父部件宽 15%）和伸进腿部范围的
+   * （裙摆、上衣下摆）不转。原因是拼合式切图里部件之间没有重叠：手臂外缘和
+   * 躯干的交界是切出来的一条线，躯干在手臂底下没有像素，手臂绕肩一转，
+   * 这条线就张成一道楔形的缝（kkk 实测转 1.6° 时肘部缝宽 7px，缩到 0.5° 还有
+   * 1px 的线）。头和头发的接缝在脖子 / 发根，有父件压着，晃了不露。
+   *
+   * 以后补图能把被盖住的边缘补出一圈余量，再把手臂外张加回来。
+   */
+  const legTop = Math.max(-Infinity, ...bones
+    .filter((b) => legs.has(b.name) && extent.has(b.name))
+    .map((b) => extent.get(b.name).top));
+  for (const b of bones) {
+    if (skip(b) || isTop(b) || noRotate.has(b.name)) continue;
+    const pw = attOf(parentOf(b))?.width ?? 0;
+    if (pw > 0 && Math.abs(b.x ?? 0) >= pw * 0.15) continue;
+    if ((extent.get(b.name)?.bottom ?? Infinity) < legTop) continue;
+    if (genOf(b) !== 1) continue;
+    // 比起伏晚 0.1 个周期，像是被身体带着动
+    const angle = (u) => HEAD_SWAY_DEG * Math.sin((u - 0.1) * Math.PI * 2);
+    idle.bones[b.name] = { rotate: track((u) => ({ [rotKey]: +angle(u).toFixed(3) })) };
+  }
 
   skeleton.animations = { idle };
   return skeleton;
@@ -334,6 +444,26 @@ function sine(duration, steps, fn) {
     keys.push({ time: +(t * duration).toFixed(3), ...fn(t) });
   }
   return keys;
+}
+
+/**
+ * 附件在静止姿势下的上下边（Spine 坐标，Y 向上）。
+ * region 的原点在图心；mesh 的顶点相对骨骼原点，再加 attachment 偏移。
+ */
+function extentOf(att, boneWorld) {
+  if (!att || !boneWorld) return null;
+  const oy = att.y ?? 0;
+  let lo = -(att.height ?? 0) / 2;
+  let hi = (att.height ?? 0) / 2;
+  if (att.type === 'mesh' && att.vertices?.length) {
+    lo = Infinity;
+    hi = -Infinity;
+    for (let i = 1; i < att.vertices.length; i += 2) {
+      lo = Math.min(lo, att.vertices[i]);
+      hi = Math.max(hi, att.vertices[i]);
+    }
+  }
+  return { bottom: boneWorld.y + oy + lo, top: boneWorld.y + oy + hi };
 }
 
 /**
