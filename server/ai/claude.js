@@ -400,6 +400,20 @@ export async function parseWithRetry(response, request, client, imageSize) {
 }
 
 /**
+ * 把响应里所有 text 块按顺序拼起来。
+ *
+ * 不能只读 content[0]：claude-opus-5-5 即使请求里没开 thinking 也会先自己想，
+ * 返回的第一块是 thinking（内容为空、只带 signature），正文在后面的 text 块里。
+ * 只读第一块就拿到空串，报"无法提取响应文本"——部件表其实已经回来了。
+ */
+export function responseText(response) {
+  return (response?.content ?? [])
+    .filter((b) => b?.type === 'text' || (b?.type === undefined && typeof b?.text === 'string'))
+    .map((b) => b.text ?? '')
+    .join('');
+}
+
+/**
  * 解析 AI 响应
  *
  * AI 返回的是归一化比例（0~1），这里乘以真实图片尺寸转成像素坐标。
@@ -409,15 +423,7 @@ export async function parseWithRetry(response, request, client, imageSize) {
 export function parseResponse(response, imageSize) {
   try {
     // 提取文本内容
-    let text = null;
-
-    if (response.content?.[0]?.text) {
-      text = response.content[0].text;
-    } else if (response.message?.content) {
-      text = response.message.content;
-    } else if (response.text) {
-      text = response.text;
-    }
+    const text = responseText(response) || response.message?.content || response.text || null;
 
     if (!text) {
       throw new Error('无法提取响应文本');
@@ -631,7 +637,7 @@ export async function classifyImage(imagePath, options) {
       }]
     });
 
-    const text = response.content[0]?.text?.trim().toLowerCase() || '';
+    const text = responseText(response).trim().toLowerCase();
     
     // 提取类别代号（去掉可能的多余字符）
     const match = text.match(/\b(character|prop|effect|item)\b/);
