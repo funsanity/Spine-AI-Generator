@@ -65,8 +65,9 @@ pivot 同样是归一化比例，但**相对于该部件自己 bbox 的左上角
    - 水果被篮筐挡住 → bbox 要扩到完整轮廓（补图要把它补成完整的西瓜）
    - 篮筐前层/后层 → bbox 只覆盖自己露出的范围（它们是同一物体的两个深度切片）
 
-6. **部件数量控制在 6~15 个**
-   太碎导致骨骼冗余；太粗则无法独立运动。
+6. **部件数量由你根据这张图判断，最多 {{MAX_PARTS}} 个**
+   看图里有哪些需要独立运动或独立分层的部分，每个一个部件——简单的物品可能只要 1-3 个，
+   复杂的角色可能要二三十个。不要为了凑数拆，也不要为了省事合并会分开动的部分。
    不要拆文字、纹理、渐变、装饰线等不会独立运动的细节。
 
 7. **bbox 不能超出图片边界**
@@ -222,8 +223,48 @@ export const REASONING_LEVELS = {
   high: { label: '高', budget: 24576 }
 };
 
-/** 不开思考时的输出上限。拆 6~15 个部件的 JSON 够用 */
+/**
+ * 部件数量上限（用户 2026-11-02：数量由模型按图判断，只写死上限，比如 33）。
+ * 提示词里只给上限；模型超了由 capParts 裁掉。
+ */
+export const DEFAULT_MAX_PARTS = 33;
+
+/** 不开思考时的输出上限。8192 够 15 个部件的 JSON */
 const BASE_MAX_TOKENS = 8192;
+
+/**
+ * 输出上限随部件数上限放大：实测 12 个部件约 20KB（每个部件 8~16 个多边形顶点），
+ * 折合每个部件 600+ token。33 个部件给 8192 必然截断、整轮白跑。
+ */
+export function maxTokensFor(maxParts) {
+  return Math.max(BASE_MAX_TOKENS, Math.ceil(maxParts * 700));
+}
+
+/** 拆图提示词：部件数量上限填进去 */
+export function buildAnalysisPrompt({ maxParts = DEFAULT_MAX_PARTS, tightCutout = false } = {}) {
+  return ANALYSIS_PROMPT.replace('{{MAX_PARTS}}', String(maxParts)) + (tightCutout ? TIGHT_CUTOUT_RULES : '');
+}
+
+/**
+ * 超过上限时去掉面积最小的叶子部件（没有子部件的）。
+ * 叶子才能去：去掉有子部件的会让子部件挂空。被去掉的像素不会丢——
+ * 切图对无主像素有按框/连通性认领，会归给周围的部件。
+ */
+export function capParts(parts, maxParts) {
+  if (parts.length <= maxParts) return { parts, dropped: [] };
+  const kept = [...parts];
+  const dropped = [];
+  const area = (p) => (p.bbox?.width ?? 0) * (p.bbox?.height ?? 0);
+  while (kept.length > maxParts) {
+    const parents = new Set(kept.map((p) => p.parent).filter(Boolean));
+    const leaves = kept.filter((p) => !parents.has(p.name) && p.parent);
+    if (!leaves.length) break;
+    leaves.sort((a, b) => area(a) - area(b));
+    kept.splice(kept.indexOf(leaves[0]), 1);
+    dropped.push(leaves[0].name);
+  }
+  return { parts: kept, dropped };
+}
 
 /**
  * 截断重发的上限。
@@ -299,6 +340,15 @@ export async function createWithRetry(client, request, baseMs = RETRY_BASE_MS) {
   }
 }
 
+// 按文件头判断图片类型。multer 存的上传文件没有扩展名，按后缀猜会把 PNG 报成 jpeg，API 直接 400
+function detectImageMime(buf) {
+  if (buf.length >= 8 && buf.readUInt32BE(0) === 0x89504e47) return 'image/png';
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 6 && buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return 'image/png';
+}
+
 /**
  * 分析图片并生成部件结构（带精确像素 bbox）
  *
@@ -313,8 +363,9 @@ export async function analyzeImage(imagePath, prompt, options) {
   const level = REASONING_LEVELS[options.reasoning] ?? REASONING_LEVELS.default;
 
   // 读取图片并转 base64
-  const imageData = readFileSync(imagePath).toString('base64');
-  const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  const imageBuf = readFileSync(imagePath);
+  const imageData = imageBuf.toString('base64');
+  const mimeType = detectImageMime(imageBuf);
 
   // 构造 Anthropic 客户端
   const client = new Anthropic({
@@ -326,12 +377,12 @@ export async function analyzeImage(imagePath, prompt, options) {
     console.log(`[AI] 正在调用 ${model} 进行精确分析（推理等级：${level.label}）...`);
 
     // 紧贴切图那档要替换拆图规则，所以拼在基础提示词之后
-    const rules = options?.tightCutout ? TIGHT_CUTOUT_RULES : '';
-    const fullPrompt = `${ANALYSIS_PROMPT}${rules}\n\n用户需求：${prompt}`;
+    const maxParts = options.maxParts ?? DEFAULT_MAX_PARTS;
+    const fullPrompt = `${buildAnalysisPrompt({ maxParts, tightCutout: options?.tightCutout })}\n\n用户需求：${prompt}`;
 
     const request = {
       model,
-      max_tokens: level.budget ? level.budget + BASE_MAX_TOKENS : BASE_MAX_TOKENS,
+      max_tokens: level.budget ? level.budget + maxTokensFor(maxParts) : maxTokensFor(maxParts),
       messages: [{
         role: 'user',
         content: [
@@ -361,6 +412,12 @@ export async function analyzeImage(imagePath, prompt, options) {
     console.log(`[AI] API 调用成功（stop_reason=${response.stop_reason ?? 'n/a'}）`);
 
     const analysis = await parseWithRetry(response, request, client, imageSize);
+    const capped = capParts(analysis.parts, maxParts);
+    if (capped.dropped.length) {
+      console.warn(`[AI] 模型拆了 ${analysis.parts.length} 个部件，超过上限 ${maxParts}，去掉最小的：${capped.dropped.join('、')}`);
+      analysis.parts = capped.parts;
+      analysis.droppedParts = capped.dropped;
+    }
     analysis.sourceImage = imagePath;
     return analysis;
 
@@ -604,8 +661,9 @@ export async function classifyImage(imagePath, options) {
   const { apiKey, baseURL } = options;
   const model = options.model || DEFAULT_MODEL;
 
-  const imageData = readFileSync(imagePath).toString('base64');
-  const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  const imageBuf = readFileSync(imagePath);
+  const imageData = imageBuf.toString('base64');
+  const mimeType = detectImageMime(imageBuf);
 
   const client = new Anthropic({
     apiKey,
