@@ -1410,3 +1410,36 @@ textarea {
 .modal-actions .btn-secondary:hover {
   background: var(--border);
 }
+
+/*
+ * 父开关下面的子选项（像素级分割 → 分割器；启用补图 → 补图模型/次数/整件重画）。
+ * 缩进 + 左边一条竖线表示「归上面那个开关管」；父开关关掉时整块变淡、点不动。
+ * 不用 disabled：分割器的单选还要按环境装没装单独置灰（syncSamStatus），两套会打架。
+ */
+.sub-options {
+  margin: 6px 0 0 7px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+
+.sub-options.is-off {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.sub-options .seg-row {
+  margin-left: 0;
+}
+
+.sub-options .form-group {
+  margin-bottom: 6px;
+}
+
+.sub-options .sub-gap {
+  margin-top: 10px;
+}
+
+/* 没有折叠按钮的标题（提示词）：标题文字撑开，按钮靠右 */
+.section-head > span:first-child {
+  flex: 1;
+}

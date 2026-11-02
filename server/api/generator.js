@@ -424,6 +424,10 @@ export function generateAnimations(skeleton) {
     if (pw > 0 && Math.abs(b.x ?? 0) >= pw * 0.15) continue;
     if ((extent.get(b.name)?.bottom ?? Infinity) < legTop) continue;
     if (genOf(b) !== 1) continue;
+    // 得整体伸在父部件上方（中线高过父部件顶边）。居中的披风也满足上面几条，
+    // 但它侧边一路贴着上衣，一转就裂（kkk 实测 idle 内部缝 332px）
+    const e = extent.get(b.name), pe = extent.get(parentOf(b)?.name);
+    if (!e || !pe || (e.top + e.bottom) / 2 <= pe.top) continue;
     // 比起伏晚 0.1 个周期，像是被身体带着动
     const angle = (u) => HEAD_SWAY_DEG * Math.sin((u - 0.1) * Math.PI * 2);
     idle.bones[b.name] = { rotate: track((u) => ({ [rotKey]: +angle(u).toFixed(3) })) };

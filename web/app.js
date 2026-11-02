@@ -551,11 +551,11 @@ loadApiDefaults().then(loadApiConfig);
 const TRACKED_INPUTS = [
   'prompt', 'modelSelect', 'reasoningSelect', 'exportTarget',
   'outputDir', 'projectName',
-  'densityInput', 'marginInput', 'bleedInput', 'imageModelSelect', 'maxInpaintInput'
+  'densityInput', 'marginInput', 'bleedInput', 'imageModelSelect', 'maxInpaintInput', 'maxPartsInput'
 ];
 
 // 复选框的状态在 .checked 上，不在 .value 上，得分开存取
-const TRACKED_TOGGLES = ['cleanToggle', 'inpaintToggle', 'tightCutToggle', 'snapToggle', 'backgroundToggle', 'samToggle'];
+const TRACKED_TOGGLES = ['cleanToggle', 'inpaintToggle', 'redrawToggle', 'tightCutToggle', 'snapToggle', 'backgroundToggle', 'samToggle'];
 
 /*
  * 分割器单选组的存储键。
@@ -760,14 +760,9 @@ function syncParamLabels() {
   }
 
   // 折叠起来后标题行右边的摘要。没有它，收起状态下改没改过参数完全看不出来。
-  // 补图状态也带上：它是这一档里唯一会让耗时和费用翻倍的东西，
-  // 收起来看不到就有可能在不知情的情况下跑一次很贵的生成。
-  const inpaint = document.getElementById('inpaintToggle');
-  const imageModel = document.getElementById('imageModelSelect');
-  if (inpaint?.checked) parts.push(imageModel?.value ? `补图 ${imageModel.value}` : '补图');
-
   const summary = document.getElementById('meshSummary');
-  if (summary) summary.textContent = parts.join(' · ');
+  if (summary) summary.textContent = `密度 ${parts.join(' · ')}`;
+  syncSectionSummaries();
 }
 
 /**
@@ -788,6 +783,38 @@ function syncSectionSummaries() {
 
   const output = document.getElementById('outputSummary');
   if (output) output.textContent = projectDirText();
+
+  const checked = (id) => document.getElementById(id)?.checked === true;
+
+  // 拆分：模型 + 部件上限
+  const maxParts = document.getElementById('maxPartsInput')?.value;
+  if (model && maxParts) model.textContent += ` · ≤${maxParts} 件`;
+
+  // 切图：用的哪个分割器、两个收紧开关开没开
+  const cut = document.getElementById('cutSummary');
+  if (cut) {
+    const seg = document.querySelector('input[name="segmenter"]:checked')?.nextElementSibling?.textContent;
+    cut.textContent = [
+      checked('samToggle') ? (seg ?? '像素级') : '多边形',
+      checked('tightCutToggle') ? '紧贴' : null,
+      checked('snapToggle') ? '吸附' : null
+    ].filter(Boolean).join(' · ');
+  }
+
+  // 补图：它是唯一会让耗时和费用翻倍的东西，收起来也必须看得到开没开
+  const inpaint = document.getElementById('inpaintSummary');
+  if (inpaint) {
+    const imageModel = document.getElementById('imageModelSelect')?.value;
+    const times = document.getElementById('maxInpaintInput')?.value;
+    inpaint.textContent = !checked('inpaintToggle') ? '关'
+      : [imageModel || '未选模型', times ? `≤${times} 次` : null, checked('redrawToggle') ? '整件重画' : null]
+        .filter(Boolean).join(' · ');
+  }
+
+  // 父开关关掉时，挂在它下面的子选项变淡
+  for (const box of document.querySelectorAll('.sub-options[data-parent]')) {
+    box.classList.toggle('is-off', !checked(box.dataset.parent));
+  }
 }
 
 /**
@@ -814,8 +841,13 @@ for (const id of ['modelSelect', 'reasoningSelect']) {
   document.getElementById(id)?.addEventListener('change', syncSectionSummaries);
 }
 
-for (const id of ['inpaintToggle', 'tightCutToggle', 'imageModelSelect']) {
-  document.getElementById(id)?.addEventListener('change', syncParamLabels);
+for (const id of ['inpaintToggle', 'redrawToggle', 'tightCutToggle', 'snapToggle', 'samToggle',
+  'imageModelSelect', 'maxInpaintInput', 'maxPartsInput']) {
+  document.getElementById(id)?.addEventListener('change', syncSectionSummaries);
+  document.getElementById(id)?.addEventListener('input', syncSectionSummaries);
+}
+for (const el of document.querySelectorAll('input[name="segmenter"]')) {
+  el.addEventListener('change', syncSectionSummaries);
 }
 
 
@@ -1099,6 +1131,7 @@ async function syncSamStatus() {
     const st = await res.json();
 
     setCheckedSegmenter(st.segmenter);
+    syncSectionSummaries();
 
     /*
      * 置灰没装的那个。alternates 是服务端报的两个环境各自的就绪状态 ——
@@ -1129,6 +1162,7 @@ async function syncSamStatus() {
     // 当前选的那个没装：关掉开关并说明怎么装
     toggle.checked = false;
     toggle.disabled = false;
+    syncSectionSummaries();
     hint.textContent = `未安装 ${cur.label}，当前用 AI 多边形轮廓切图（较粗）。安装后切图轮廓精确到像素级：`
       + cur.setup;
     hint.style.color = 'var(--warning, #b8860b)';
@@ -1503,6 +1537,7 @@ generateBtn.addEventListener('click', async () => {
   formData.append('margin', document.getElementById('marginInput').value);
   formData.append('bleed', document.getElementById('bleedInput').value);
   formData.append('inpaint', document.getElementById('inpaintToggle').checked ? 'true' : 'false');
+  formData.append('redraw', document.getElementById('redrawToggle')?.checked ? 'true' : 'false');
   formData.append('tightCut', document.getElementById('tightCutToggle').checked ? 'true' : 'false');
   formData.append('snap', document.getElementById('snapToggle').checked ? 'true' : 'false');
   formData.append('useSam', document.getElementById('samToggle').checked ? 'true' : 'false');
@@ -1513,6 +1548,7 @@ generateBtn.addEventListener('click', async () => {
   formData.append('background', document.getElementById('backgroundToggle').checked ? 'true' : 'false');
   formData.append('imageModel', document.getElementById('imageModelSelect').value);
   formData.append('maxInpaintAttempts', document.getElementById('maxInpaintInput')?.value ?? '2');
+  formData.append('maxParts', document.getElementById('maxPartsInput')?.value ?? '33');
 
   try {
     const response = await fetch('/api/generate', {
@@ -2080,6 +2116,12 @@ retryInpaintBtn?.addEventListener('click', async () => {
           (currentCutResults ?? [])
             .filter((c) => failedInpaintNames.includes(c.name))
             .map((c) => [c.name, c.occlusionEdges ?? []])
+        ),
+        // 新补图路径要的画布信息，同样只存在前端
+        cutMap: Object.fromEntries(
+          (currentCutResults ?? [])
+            .filter((c) => failedInpaintNames.includes(c.name))
+            .map((c) => [c.name, { bbox: c.bbox, hiddenBox: c.hiddenBox, hiddenPath: c.hiddenPath ?? null }])
         ),
         apiKey: document.getElementById('apiKey').value.trim(),
         baseURL: document.getElementById('baseURL').value.trim(),
