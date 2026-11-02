@@ -17,8 +17,12 @@
  */
 
 import sharp from 'sharp';
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
 import FormData from 'form-data';
+import { join } from 'path';
+import {
+  keyWhiteBackground, softenWhiteEdge, registerModel, warpModel, composeAmodal, scoreAmodal, fallbackFill
+} from './amodal.js';
 import { bleedAlpha } from './cutter.js';
 
 /** 低于此 alpha 视为"缺内容"，要交给模型补 */
@@ -360,10 +364,31 @@ export async function maskCoverage(maskBuffer) {
 }
 
 /**
+ * 内部灰度蒙版 → 图像编辑接口要的蒙版。
+ *
+ * OpenAI 的 /v1/images/edits 规定：蒙版是**带 alpha 的 PNG，alpha=0 处重画**。
+ * 这里曾经直接发灰度图（3 通道、无 alpha、白 = 重画），中转站一律回
+ * "HTTP 500: The model service is temporarily unavailable"——看着像服务宕机，
+ * 重试多少次都一样。实测 kkk 一轮 11 个部件全挂、白等 990 秒；同一张 body
+ * 换成规范蒙版立刻就过。语义也是反的：白蒙版加上 alpha 后能过，但模型几乎
+ * 不动洞里（重画区平均只变 17），规范蒙版下重画区平均变 114。
+ */
+export async function toApiMask(maskBuf) {
+  const { data, width, height } = await readMask(maskBuf);
+  const rgba = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    rgba[i * 4 + 3] = data[i] > 127 ? 0 : 255;
+  }
+  return sharp(rgba, { raw: { width, height, channels: 4 } }).png().toBuffer();
+}
+
+/**
  * 调一次图像编辑接口。
  *
  * 用 multipart 而不是 JSON：只有 multipart 能直接传本地文件，
  * 走 URL 的形式要求图片先传到公网，本地工具没这个条件。
+ *
+ * maskBuf 用本模块内部的约定（灰度，白 = 要重画），发出去前换成接口的约定。
  *
  * @returns {Promise<Buffer>} 模型返回的图片（PNG）
  */
@@ -372,7 +397,7 @@ export async function editImage({ apiKey, baseURL, model, imageBuf, maskBuf, pro
   form.append('model', model);
   form.append('prompt', prompt);
   form.append('image', imageBuf, { filename: 'image.png', contentType: 'image/png' });
-  form.append('mask', maskBuf, { filename: 'mask.png', contentType: 'image/png' });
+  form.append('mask', await toApiMask(maskBuf), { filename: 'mask.png', contentType: 'image/png' });
   if (size) form.append('size', size);
 
   /*
@@ -424,6 +449,38 @@ export async function editImage({ apiKey, baseURL, model, imageBuf, maskBuf, pro
   }
 
   throw new Error('返回体里没有可用的图片字段');
+}
+
+/**
+ * 调图像编辑接口，临时故障自动重试。
+ *
+ * 中转站在连续调用图像接口时很容易甩回 400/429/5xx：失败请求常常在
+ * 1 秒内就返回（根本没轮到模型），而成功的要 25~35 秒。这种"瞬时的、快
+ * 速的拒绝"重试一次往往就过了，而一次补图失败意味着这个部件的接缝要一直
+ * 露到重跑整条流程为止——重跑一次要 5 分钟，退避几秒重试明显划算。
+ *
+ * 只重试"看起来是临时故障"的状态码；401/403（key 不对）不重试，
+ * 重试一百次也不会变对。
+ */
+const RETRY_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+
+async function editWithRetry(args) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await editImage(args);
+    } catch (err) {
+      lastErr = err;
+      // 没拿到状态码说明是网络层错误（超时、连接被断），同样值得重试
+      const retriable = err.status === undefined || RETRY_STATUS.has(err.status);
+      if (!retriable || attempt === MAX_ATTEMPTS) break;
+      // 2s → 8s 退避，给中转站一点喘息时间
+      await new Promise((r) => setTimeout(r, attempt * 2000 * attempt));
+    }
+  }
+  lastErr.message = `${lastErr.message}（已重试 ${MAX_ATTEMPTS} 次）`;
+  throw lastErr;
 }
 
 /**
@@ -486,7 +543,255 @@ function spreadOwnColor(src, w, h) {
  * 结果尺寸和原图完全一致——模型输出的分辨率未必对得上，
  * 所以按原尺寸缩回去，再只把蒙版内的像素盖上去。
  */
-export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, occlusionEdges, size, maxQualityAttempts = 2 }) {
+export async function inpaintPart(pngPath, opts) {
+  // cutter 给了画布（hiddenBox）就走新路径：模型画完整部件，只取被挡住的那部分
+  if (opts.hiddenBox) return inpaintAmodal(pngPath, opts);
+  return inpaintLegacy(pngPath, opts);
+}
+
+/**
+ * 图像接口熔断：同一个 5xx 连续 threshold 次就停。
+ *
+ * 中转站图像接口挂掉时是整片挂（实测连续 500），逐个部件各重试一遍只是白等，
+ * 日志里刷满同一句错误。4xx 不熔断：多半是单个请求的问题（尺寸、内容），换个部件可能就好。
+ */
+export function createInpaintBreaker({ threshold = 2 } = {}) {
+  let streak = 0, lastStatus = null;
+  const b = {
+    tripped: false,
+    reason: '',
+    record(err) {
+      const st = err?.status;
+      // 4xx 是单个请求的问题，不算；没有状态码的是超时/断连，和 5xx 一样是接口整体出事
+      if (!err || (st !== undefined && st < 500)) { streak = 0; lastStatus = null; return; }
+      const key = st ?? 'net';
+      streak = key === lastStatus ? streak + 1 : 1;
+      lastStatus = key;
+      if (streak >= threshold) {
+        b.tripped = true;
+        const what = st !== undefined ? `HTTP ${st}` : '超时或断连';
+        b.reason = `图像接口连续返回同一错误（${what}：${String(err.message).slice(0, 120)}）`;
+      }
+    }
+  };
+  return b;
+}
+
+/**
+ * 补图把窗口撑大（被挡部分伸出原窗口）后，同步切图结果的 bbox/size/pivot。
+ * pivot 是相对 bbox 左上角的：左上角往外挪多少，pivot 就往回补多少，骨头在源图上的位置不变。
+ * 必须在 applyCutGeometry 之前调。
+ */
+export function applyInpaintBbox(cut, bbox) {
+  if (!bbox) return cut;
+  const old = cut.bbox;
+  if (old.x === bbox.x && old.y === bbox.y && old.width === bbox.width && old.height === bbox.height) return cut;
+  if (cut.pivot) cut.pivot = { x: cut.pivot.x + (old.x - bbox.x), y: cut.pivot.y + (old.y - bbox.y) };
+  cut.bbox = { ...bbox };
+  cut.size = { width: bbox.width, height: bbox.height };
+  return cut;
+}
+
+/** 读 PNG 的 alpha 成 0/1 掩码 */
+async function readAlphaMask(path, w, h) {
+  const d = await sharp(path).ensureAlpha().raw().toBuffer();
+  const m = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) m[i] = d[i * 4 + 3] > 127 ? 1 : 0;
+  return m;
+}
+
+/**
+ * 补图新路径（设计：docs/superpowers/specs/2026-11-02-amodal-part-layers-design.md）。
+ *
+ * 旧路径的三个毛病（2026-11-02 实测 kkk）：
+ *   - 被挡区按「遮挡者盖住的范围」整块填实，body 肩上多出一个披风形状的鼓包；
+ *   - 守卫见洞里近白多就整块铺四周均色，body 被挡的 16867px 里 16849px 成了平涂色块；
+ *   - 模型输出整体偏 ~11px、拉伸 0.8%，从没和原图对齐过。
+ *
+ * 新路径：可见像素放白底、被挡处盖洋红斜纹，让模型把这个部件**单独完整地**画出来；
+ * 抠掉白底得到它的轮廓，配准到可见像素，只把被挡位置的模型像素合成进来。
+ * 可见像素一个不动，形状由模型画的轮廓决定，模型画不好就在部件轮廓内平滑填色兜底。
+ *
+ * @returns {{ status: 'done'|'fallback'|'skipped', bbox, attempts, best, coverage? }}
+ *   bbox 是源图坐标：被挡部分可能伸出原窗口，调用方要用它更新切图位置和 pivot
+ */
+async function inpaintAmodal(pngPath, {
+  apiKey, baseURL, model, partName, occlusionEdges, maxQualityAttempts = 2,
+  hiddenPath, hiddenBox, partBox, saveRawDir, keepWindow = false,
+  // 实验：整件用模型画的（用户 2026-11-02 觉得 _inpaint 原图比合成结果干净），
+  // 没被挡的部件也送去重画；默认关
+  redraw = false
+}) {
+  if (!hiddenPath && !redraw) {
+    return { skipped: true, status: 'skipped', reason: '没有被挡住的部分', bbox: { ...partBox } };
+  }
+  if (!hiddenBox) {
+    // 没被挡的部件：画布按窗口四周留 8%，给模型画完整轮廓的余地
+    const px = Math.round(partBox.width * 0.08), py = Math.round(partBox.height * 0.08);
+    const x = Math.max(0, partBox.x - px), y = Math.max(0, partBox.y - py);
+    hiddenBox = { x, y, width: partBox.x + partBox.width + px - x, height: partBox.y + partBox.height + py - y };
+  }
+  const W = hiddenBox.width, H = hiddenBox.height;
+  const ox = partBox.x - hiddenBox.x, oy = partBox.y - hiddenBox.y;
+
+  // 可见像素按源图位置放进画布
+  const part = await sharp(pngPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const pw = part.info.width, ph = part.info.height;
+  const visible = Buffer.alloc(W * H * 4);
+  for (let y = 0; y < ph; y++) {
+    for (let x = 0; x < pw; x++) {
+      const cx = x + ox, cy = y + oy;
+      if (cx < 0 || cy < 0 || cx >= W || cy >= H) continue;
+      part.data.copy(visible, (cy * W + cx) * 4, (y * pw + x) * 4, (y * pw + x) * 4 + 4);
+    }
+  }
+  const hidden = hiddenPath ? await readAlphaMask(hiddenPath, W, H) : new Uint8Array(W * H);
+
+  // 旧擦除掩码 = 被挡区 ∩ 本部件轮廓（窗口坐标）：只给兜底限定平滑填色的范围
+  const erasedPath = pngPath.replace(/\.png$/, '.erased.png');
+  const region = new Uint8Array(W * H);
+  const hasErased = await sharp(erasedPath).metadata().then(() => true, () => false);
+  if (hasErased) {
+    const em = await readAlphaMask(erasedPath, pw, ph);
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+      const cx = x + ox, cy = y + oy;
+      if (em[y * pw + x] && cx >= 0 && cy >= 0 && cx < W && cy < H) region[cy * W + cx] = 1;
+    }
+  }
+
+  /*
+   * 送模型的输入：白底 + 可见像素 + 被挡处洋红斜纹。
+   * 白底（而不是旧的「本部件颜色铺满」）让模型的输出也是白底，抠得干净；
+   * 斜纹告诉它「这里有东西被挡住了，要接着画」——洋红在画里不会出现，不会被当成内容。
+   */
+  const img = Buffer.alloc(W * H * 3);
+  for (let i = 0; i < W * H; i++) {
+    const a = visible[i * 4 + 3] / 255;
+    const x = i % W, y = (i / W) | 0;
+    const stripe = hidden[i] && a < 0.5 && (((x + y) / 10) | 0) % 2 === 0;
+    const bg = stripe ? [255, 0, 255] : [255, 255, 255];
+    for (let c = 0; c < 3; c++) img[i * 3 + c] = Math.round(visible[i * 4 + c] * a + bg[c] * (1 - a));
+  }
+  const scale = Math.min(1, MAX_EDGE / Math.max(W, H));
+  const reqW = Math.max(16, Math.round((W * scale) / 16) * 16);
+  const reqH = Math.max(16, Math.round((H * scale) / 16) * 16);
+  const imageBuf = await sharp(img, { raw: { width: W, height: H, channels: 3 } })
+    .resize(reqW, reqH, { fit: 'fill' }).ensureAlpha().png().toBuffer();
+  // 蒙版：可见像素保留，其余全部可以画（内部灰度约定，白 = 重画）
+  const gray = Buffer.alloc(W * H);
+  for (let i = 0; i < W * H; i++) gray[i] = visible[i * 4 + 3] >= 128 ? 0 : 255;
+  const maskBuf = await sharp(gray, { raw: { width: W, height: H, channels: 1 } })
+    .resize(reqW, reqH, { fit: 'fill' }).png().toBuffer();
+
+  const edges = Array.isArray(occlusionEdges) && occlusionEdges.length ? occlusionEdges : [];
+  const prompt = [
+    `This is "${partName}", one part of a 2D game character, cut out and placed on a plain white background.`,
+    'The magenta/white striped areas mark where other parts were covering it.',
+    edges.length ? `It is covered on the ${edges.join(' and ')} side(s).` : '',
+    'Redraw this part COMPLETE and ALONE, as if nothing were in front of it:',
+    'continue its silhouette, outline, folds and texture through the striped areas so the shape closes naturally.',
+    'Keep the existing pixels, art style, pose, scale and position exactly.',
+    'Pure white background, no shadow, no other body parts, no magenta.'
+  ].filter(Boolean).join(' ');
+
+  const qMax = Math.max(1, Math.min(5, Math.round(maxQualityAttempts) || 2));
+  let best = null;
+  let bestOk = null;
+  let bestUsable = null;
+  let lastErr = null;
+  for (let q = 1; q <= qMax; q++) {
+    let out;
+    try {
+      out = await editWithRetry({ apiKey, baseURL, model, imageBuf, maskBuf, prompt, size: 'auto' });
+    } catch (err) {
+      lastErr = err;
+      continue;
+    }
+    /*
+     * 中转站有时回白底 RGB，有时回透明底 RGBA（背景 0,0,0,0）。直接丢掉 alpha，
+     * 透明底就成了纯黑，抠白抠不掉，整片黑被当成部件贴进被挡区（2026-11-02 用户实测：
+     * 头的脖子下、大腿顶上大块黑）。先垫白再抠，并且尊重 PNG 自己的透明。
+     *
+     * 模型只按自己的固定档位出图（实测 1000~1600px，部件画布才 130~540px）。
+     * 先用 sharp 按面积缩回画布大小再抠、再配准：配准时的双线性采样一次只看 4 个点，
+     * 直接从 3~8 倍大的图上采，边缘会丢细节、起锯齿。
+     */
+    const m = await sharp(out).flatten({ background: '#ffffff' })
+      .resize(W, H, { fit: 'fill' }).raw().toBuffer({ resolveWithObject: true });
+    const mw = m.info.width, mh = m.info.height;
+    const alpha = keyWhiteBackground(m.data, mw, mh);
+    const meta = await sharp(out).metadata();
+    if (meta.hasAlpha) {
+      const own = await sharp(out).ensureAlpha().extractChannel(3).resize(W, H, { fit: 'fill' }).raw().toBuffer();
+      for (let i = 0; i < mw * mh; i++) if (own[i] < alpha[i]) alpha[i] = own[i];
+    }
+    // 缩小后轮廓上混进了白底：拆成半透明 + 部件原色，不然拼到深色上一圈白边
+    softenWhiteEdge(m.data, alpha, mw, mh);
+    const t = registerModel({ rgba: visible, w: W, h: H }, { rgb: m.data, w: mw, h: mh });
+    const warped = warpModel({ rgb: m.data, alpha, w: mw, h: mh }, t, W, H);
+    if (saveRawDir) {
+      // 存抠好、对齐到画布的那张：透明底、和原图部件一样大（原始返回图 1MB+、底色不统一，没法直接看）
+      await mkdir(saveRawDir, { recursive: true });
+      await sharp(warped, { raw: { width: W, height: H, channels: 4 } }).png()
+        .toFile(join(saveRawDir, `${partName}-${q}.png`));
+    }
+    const score = scoreAmodal({ visible, modelWarped: warped, hidden, w: W, h: H, cost: t.cost });
+    const cand = { q, score, warped };
+    if (!best || score.cost < best.score.cost) best = cand;
+    if (score.ok && (!bestOk || score.cost < bestOk.score.cost)) bestOk = cand;
+    if (score.usable && (!bestUsable || score.cost < bestUsable.score.cost)) bestUsable = cand;
+    if (score.ok) break;
+    console.log(`[补图] ↻ ${partName} 第 ${q} 轮不合格（色差 ${score.cost.toFixed(1)}，覆盖 ${(score.coverage * 100).toFixed(0)}%，洋红 ${(score.magentaFrac * 100).toFixed(1)}%）`);
+  }
+  if (!best && lastErr) throw lastErr;
+
+  let rgba;
+  let status;
+  // 没有一轮达到严格线时，略差但轮廓对得上的最好一轮也比兜底好
+  const chosen = bestOk ?? bestUsable;
+  if (chosen) {
+    rgba = redraw ? chosen.warped : composeAmodal({ visible, hidden, model: chosen.warped, w: W, h: H });
+    status = 'done';
+  } else {
+    // 没有一轮合格：明显画错的内容不进切图，在部件轮廓内用边缘色平滑补上（用户要的「光滑些」）
+    rgba = fallbackFill({ visible, region, w: W, h: H });
+    status = 'fallback';
+  }
+
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  if (keepWindow) {
+    // 重跑补图时骨架已经按原窗口建好了，窗口一变贴图就错位：只能补窗口内那部分
+    x0 = ox; y0 = oy; x1 = ox + pw - 1; y1 = oy + ph - 1;
+  } else {
+    // 收紧到最终内容（边外取色靠下面的 spreadOwnColor，不用留空边）
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (rgba[(y * W + x) * 4 + 3] < ALPHA_CUTOFF) continue;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    if (x1 < 0) return { skipped: true, status: 'skipped', reason: '合成后为空', bbox: { ...partBox } };
+  }
+  // 透明处铺上邻近颜色（只写 RGB）：网格拉伸采到边外时取到的是内容色而不是黑
+  const spread = spreadOwnColor(rgba, W, H);
+  for (let i = 0; i < W * H; i++) spread[i * 4 + 3] = rgba[i * 4 + 3];
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+  await sharp(spread, { raw: { width: W, height: H, channels: 4 } })
+    .extract({ left: x0, top: y0, width: cw, height: ch })
+    .png().toFile(pngPath);
+
+  return {
+    ok: true,
+    status,
+    bbox: { x: hiddenBox.x + x0, y: hiddenBox.y + y0, width: cw, height: ch },
+    attempts: best ? best.q : 0,
+    // 没达到严格线、用的是「略差但可用」的那一轮
+    soft: !bestOk && !!bestUsable,
+    best: best ? { cost: best.score.cost, coverage: best.score.coverage, magentaFrac: best.score.magentaFrac } : null,
+    coverage: hidden.reduce((s, v) => s + v, 0) / (W * H)
+  };
+}
+
+/** 旧路径：没有被挡掩码时（老调用方、旧测试）按透明区补 */
+async function inpaintLegacy(pngPath, { apiKey, baseURL, model, partName, occlusionEdges, size, maxQualityAttempts = 2 }) {
   const original = await sharp(pngPath).ensureAlpha();
   const meta = await original.metadata();
   const { width, height } = meta;
@@ -735,49 +1040,19 @@ export async function inpaintPart(pngPath, { apiKey, baseURL, model, partName, o
   const qMax = Math.max(1, Math.min(5, Math.round(maxQualityAttempts) || 2));
 
   for (let qAttempt = 1; qAttempt <= qMax; qAttempt++) {
-    /*
-     * 失败重试。
-     *
-     * 中转站在连续调用图像接口时很容易甩回 400/429/5xx：失败请求常常在
-     * 1 秒内就返回（根本没轮到模型），而成功的要 25~35 秒。这种"瞬时的、快
-     * 速的拒绝"重试一次往往就过了，而一次补图失败意味着这个部件的接缝要一直
-     * 露到重跑整条流程为止——重跑一次要 5 分钟，退避几秒重试明显划算。
-     *
-     * 只重试"看起来是临时故障"的状态码；401/403（key 不对）不重试，
-     * 重试一百次也不会变对。
-     */
-    const RETRY_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
-    const MAX_ATTEMPTS = 3;
-
     let edited;
-    let lastErr;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        edited = await editImage({
-          apiKey, baseURL, model,
-          imageBuf: imgForApi,
-          maskBuf: maskForApi,
-          prompt,
-          size: apiSize
-        });
-        lastErr = null;
-        break;
-      } catch (err) {
-        lastErr = err;
-        // 没拿到状态码说明是网络层错误（超时、连接被断），同样值得重试
-        const retriable = err.status === undefined || RETRY_STATUS.has(err.status);
-        if (!retriable || attempt === MAX_ATTEMPTS) break;
-
-        // 2s → 6s 退避，给中转站一点喘息时间
-        const wait = attempt * 2000 * attempt;
-        await new Promise((r) => setTimeout(r, wait));
-      }
-    }
-    if (lastErr) {
-      lastErr.message = `${lastErr.message}（已重试 ${MAX_ATTEMPTS} 次）`;
+    try {
+      edited = await editWithRetry({
+        apiKey, baseURL, model,
+        imageBuf: imgForApi,
+        maskBuf: maskForApi,
+        prompt,
+        size: apiSize
+      });
+    } catch (err) {
       // 接口这一轮彻底没通：记下来，把机会让给下一次质量重试。
       // 一次都没成过的话，循环结束后再抛。
-      lastQualErr = lastErr;
+      lastQualErr = err;
       continue;
     }
 

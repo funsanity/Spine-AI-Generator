@@ -15,7 +15,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  buildMaskFromAlpha, maskCoverage, readMask, inpaintPart, editImage, ALPHA_CUTOFF
+  buildMaskFromAlpha, maskCoverage, readMask, inpaintPart, editImage, toApiMask, ALPHA_CUTOFF
 } from '../../server/api/inpaint.js';
 
 const GREEN = [0, 255, 0];
@@ -62,9 +62,16 @@ function startFakeRelay() {
         const mask = await sharp(files.mask).raw().toBuffer({ resolveWithObject: true });
         const w = img.info.width, h = img.info.height;
 
+        // 照真中转站的行为：蒙版必须带 alpha，否则 500；alpha=0 的地方才重画
+        if (mask.info.channels !== 4) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ error: { message: 'The model service is temporarily unavailable. Please try again later.' } }));
+          return;
+        }
+
         const out = Buffer.from(img.data);
         for (let i = 0; i < w * h; i++) {
-          if (mask.data[i * mask.info.channels] > 127) {
+          if (mask.data[i * 4 + 3] === 0) {
             out[i * 4] = GREEN[0]; out[i * 4 + 1] = GREEN[1];
             out[i * 4 + 2] = GREEN[2]; out[i * 4 + 3] = 255;
           }
@@ -416,6 +423,19 @@ test('inpaintPart: 非方形部件也能补（尺寸取最长边缩放）', asyn
   assert.equal(after.height, H);
 });
 
+test('toApiMask: 转成带 alpha 的 RGBA，要重画的地方 alpha=0，其余不透明', async () => {
+  const W = 100, H = 80;
+  const part = join(dir, 'api-mask-src.png');
+  await makePart(part, W, H, { x0: 30, x1: 70, y0: 20, y1: 60 });
+
+  const api = await toApiMask(await buildMaskFromAlpha(part));
+  const { data, info } = await sharp(api).raw().toBuffer({ resolveWithObject: true });
+
+  assert.equal(info.channels, 4);
+  assert.equal(data[(10 * W + 10) * 4 + 3], 0, '部件外（透明）要重画 → alpha=0');
+  assert.equal(data[(40 * W + 50) * 4 + 3], 255, '部件内容要保留 → alpha=255');
+});
+
 test('editImage: 请求里带上了模型、提示词、原图与蒙版', async () => {
   const img = await sharp({ create: { width: 32, height: 32, channels: 4, background: '#fff' } })
     .png().toBuffer();
@@ -498,87 +518,4 @@ test('editImage: 中转站返回的图尺寸与请求无关时，照样能缩回
   const after = await sharp(part).metadata();
   assert.equal(after.width, W, '宽度必须回到原尺寸');
   assert.equal(after.height, H, '高度必须回到原尺寸');
-});
-
-/**
- * 被前方部件盖住的那片：有源图真值就直接贴回去，不让模型编。
- *
- * 成因见 cutter.js 写 .erased.png 那段：模型看不到被盖住的地方下面是什么，
- * 只能照着画面里还看得见的东西推——推出来就是遮挡者的一份复制品。
- * 实测 body 在裙摆底下补出 [119,113,129]，源图那格是 [108,96,118]（裙摆
- * 的紫灰）；head 在镜片底下补出 [246,183,157]，源图那格是 [225,173,159]。
- * 静态切图看不出来（那片被盖着），两片按不同骨头转起来就是一层错色的重影。
- *
- * 源图那个像素不是猜的——它就是当时真正显示的颜色，也正是用户要的
- * 「完整 Object RGBA」。所以 cutter 把真值写进 .erased.png 的像素，
- * 补图选完轮次后把这片贴回来、alpha 给 255（留 0 就是个洞，
- * 围裙甩开时底下该有身体）。
- *
- * 这里用假中转站复现：蒙版区一律涂绿（模拟"模型照着遮挡者画"）。
- * cutter 在 .erased.png 里给了真值的那半边，落盘必须是真值色而不是绿。
- */
-test('inpaintPart: 被前方盖住但有真值的那片，用源图真值贴回而不是模型的想象', async () => {
-  const W = 96, H = 96;
-  const png = join(dir, 'front-a.png');
-
-  // 右半边不透明（部件自己的内容），左半边透明（被前方盖住的那片）
-  const px = Buffer.alloc(W * H * 4);
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 4;
-      px[i] = ART[0]; px[i + 1] = ART[1]; px[i + 2] = ART[2];
-      px[i + 3] = x >= W / 2 ? 255 : 0;
-    }
-  }
-  await sharp(px, { raw: { width: W, height: H, channels: 4 } }).png().toFile(png);
-
-  /*
-   * 擦除掩码：整个左半边，像素里存源图在那里的真值色 TRUE。
-   * 假中转站一律涂绿——所以落盘只要不是绿，就说明贴回生效了。
-   */
-  const TRUE = [200, 30, 90];
-  const em = Buffer.alloc(W * H * 4);
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const on = x < W / 2;
-      const i = (y * W + x) * 4;
-      if (on) { em[i] = TRUE[0]; em[i + 1] = TRUE[1]; em[i + 2] = TRUE[2]; }
-      em[i + 3] = 255;
-    }
-  }
-  await sharp(em, { raw: { width: W, height: H, channels: 4 } }).png()
-    .toFile(png.replace(/\.png$/, '.erased.png'));
-
-  const r = await inpaintPart(png, {
-    baseURL: relay.baseURL, apiKey: 'k', partName: 'front-a',
-    maxQualityAttempts: 1
-  });
-  assert.ok(!r.skipped, '右半边还有内容要补，不该跳过');
-
-  const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const GREEN = [0, 200, 0];
-  let leftOpaque = 0, leftTruth = 0, leftGreen = 0, rightOpaque = 0;
-  for (let y = 0; y < info.height; y++) {
-    for (let x = 0; x < info.width; x++) {
-      const i = (y * info.width + x) * 4;
-      if (data[i + 3] < 128) continue;
-      if (x >= info.width / 2) { rightOpaque++; continue; }
-      leftOpaque++;
-      const dT = Math.abs(data[i] - TRUE[0]) + Math.abs(data[i + 1] - TRUE[1]) + Math.abs(data[i + 2] - TRUE[2]);
-      if (dT < 30) leftTruth++;
-      const dG = Math.abs(data[i] - GREEN[0]) + Math.abs(data[i + 1] - GREEN[1]) + Math.abs(data[i + 2] - GREEN[2]);
-      if (dG < 30) leftGreen++;
-    }
-  }
-  const half = (info.width / 2) * info.height;
-  assert.equal(leftOpaque, half,
-    `被前方盖住的左半边要落成完整 RGBA（用户要的「完整 Object RGBA」），实际不透明 ${leftOpaque}/${half}px` +
-    `——alpha 留 0 就是个洞，围裙甩开时底下什么都没有`);
-  assert.ok(leftTruth > half * 0.9,
-    `左半边应该是源图真值（${TRUE}），实际只有 ${leftTruth}/${half}px 对得上`);
-  assert.ok(leftGreen < half * 0.1,
-    `左半边有 ${leftGreen}px 是模型画的绿——模型照着遮挡者编了内容，转起来就是一层重影`);
-  assert.ok(rightOpaque > 0, '部件自己的内容不能被吃掉');
-
-  await rm(png.replace(/\.png$/, '.erased.png'), { force: true });
 });

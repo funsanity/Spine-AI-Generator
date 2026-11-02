@@ -10,11 +10,11 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { join, dirname, relative, isAbsolute, resolve, basename } from 'path';
 import { fileURLToPath } from 'url';
-import { analyzeImage, classifyImage, DEFAULT_MODEL, REASONING_LEVELS } from './ai/claude.js';
+import { analyzeImage, classifyImage, DEFAULT_MODEL, REASONING_LEVELS, DEFAULT_MAX_PARTS } from './ai/claude.js';
 import { listModels } from './ai/models.js';
 import { readApiDefaults } from './ai/api-defaults.js';
 import { SYNC_MODELS, TASK_MODELS, pickImage, describeImageModels, DEFAULT_IMAGE_MODEL } from './ai/image-models.js';
-import { inpaintPart } from './api/inpaint.js';
+import { inpaintPart, createInpaintBreaker, applyInpaintBbox } from './api/inpaint.js';
 import { removeBackground } from './api/background.js';
 import { generateSkeleton, generateAnimations, exportToSpine } from './api/generator.js';
 import { cutImageParts, getImageSize, applyCutGeometry, diagnoseAlignment } from './api/cutter.js';
@@ -705,6 +705,8 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     const clean = req.body.clean !== 'false' && req.body.clean !== false;
     // 复选框没勾时字段不出现，所以判"显式关掉"
     const inpaint = req.body.inpaint !== 'false' && req.body.inpaint !== false;
+    // 实验：整件用模型重画（默认关）。底板不参与，它是整张画布
+    const redraw = req.body.redraw === 'true' || req.body.redraw === true;
     const imageModel = req.body.imageModel || DEFAULT_IMAGE_MODEL;
     /*
      * 每个部件最多补几次。面板默认 2，上限 5。
@@ -715,6 +717,8 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
      */
     const maxInpaintAttempts = Math.max(1, Math.min(5,
       Math.round(Number(req.body.maxInpaintAttempts)) || 2));
+    // 部件数量由模型按图判断，这里只是上限（默认 33）
+    const maxParts = Math.max(1, Math.min(60, Math.round(Number(req.body.maxParts)) || DEFAULT_MAX_PARTS));
     const tightCut = req.body.tightCut !== 'false' && req.body.tightCut !== false;
     // 剪影吸附默认开，只有显式传 'false' 才关
     const snap = req.body.snap !== 'false' && req.body.snap !== false;
@@ -844,8 +848,12 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
       imageSize,
       model,
       reasoning,
-      tightCutout: tightCut
+      tightCutout: tightCut,
+      maxParts
     });
+    if (analysis.droppedParts?.length) {
+      broadcastLog(`⚠ 模型拆了超过 ${maxParts} 个部件，去掉了最小的 ${analysis.droppedParts.length} 个：${analysis.droppedParts.join('、')}（内容归给周围部件）`, 'warning');
+    }
 
     broadcastLog(`✓ AI 分析完成，识别到 ${analysis.parts.length} 个部件`, 'success');
 
@@ -960,44 +968,75 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
      * 反而大面积 429，而且串行才能把进度一条条报给用户。
      */
     // failedNames 记下失败的是哪些部件，供「只重跑失败的部件」用
-    const inpaintReport = { enabled: inpaint, done: 0, skipped: 0, failed: 0, failedNames: [], startedAt: Date.now() };
+    // fallbackNames：模型画得不合格、退回平滑填色的部件（能用，但被挡处没有细节）
+    const inpaintReport = {
+      enabled: inpaint, done: 0, skipped: 0, failed: 0, failedNames: [], fallbackNames: [], startedAt: Date.now()
+    };
 
     if (inpaint) {
+      if (redraw) broadcastLog('整件重画（实验）：每个部件都由模型整件重画', 'warning');
       broadcastLog(
         `开始部件补图，共 ${cutResults.length} 个部件（每个最多 ${maxInpaintAttempts} 次图像调用，` +
         `模型审核不合格才重补）`,
         'progress'
       );
 
+      const breaker = createInpaintBreaker();
+      const rawDir = join(imagesDir, '_inpaint');
       for (const cut of cutResults) {
+        if (breaker.tripped) {
+          inpaintReport.failed++;
+          inpaintReport.failedNames.push(cut.name);
+          continue;
+        }
         try {
           const r = await inpaintPart(cut.path, {
             apiKey, baseURL: baseURL || undefined, model: imageModel, partName: cut.name,
             occlusionEdges: cut.occlusionEdges,
-            maxQualityAttempts: maxInpaintAttempts
+            maxQualityAttempts: maxInpaintAttempts,
+            // 新路径：模型把部件完整画出来，只取被挡住的那部分（cutter 给了画布才走）
+            hiddenPath: cut.hiddenPath, hiddenBox: cut.hiddenBox, partBox: cut.bbox, saveRawDir: rawDir,
+            redraw: redraw && cut.name !== BASE_PLATE_NAME
           });
+          // 跳过的部件没调接口，不能算「接口恢复了」，否则熔断被它清零
+          if (!r.skipped) breaker.record(null);
+          // 被挡部分伸出原窗口时窗口变大：bbox/pivot 必须在 applyCutGeometry 之前同步
+          if (r.bbox) applyInpaintBbox(cut, r.bbox);
           if (r.skipped) {
             inpaintReport.skipped++;
             broadcastLog(`  ○ ${cut.name}: ${r.reason}`, 'info');
+          } else if (r.status === 'fallback') {
+            inpaintReport.done++;
+            inpaintReport.fallbackNames.push(cut.name);
+            const b = r.best ? `（最好一轮色差 ${r.best.cost.toFixed(1)}，覆盖 ${(r.best.coverage * 100).toFixed(0)}%）` : '';
+            broadcastLog(`  △ ${cut.name}: 补图未达标${b}，被挡处改用平滑填色`, 'warning');
           } else {
             inpaintReport.done++;
             // 守卫比例露出来：高的话说明模型在这个部件上画得不好，用户能据此调次数
             const guard = r.guardedFrac > 0.02
               ? `，守卫纠正 ${(r.guardedFrac * 100).toFixed(1)}%`
               : '';
-            broadcastLog(`  ✓ ${cut.name}: 补了 ${(r.coverage * 100).toFixed(0)}% 的面积${guard}`, 'info');
+            const how = !r.best ? `补了 ${(r.coverage * 100).toFixed(0)}% 的面积${guard}`
+              : r.soft ? `没有一轮达到严格线，用了最好的一轮（色差 ${r.best.cost.toFixed(1)}，≤40 可用）`
+                : `第 ${r.attempts} 轮合格，色差 ${r.best.cost.toFixed(1)}`;
+            broadcastLog(`  ✓ ${cut.name}: ${how}`, 'info');
           }
         } catch (err) {
+          breaker.record(err);
           inpaintReport.failed++;
           inpaintReport.failedNames.push(cut.name);
           // 单个部件补图失败不能中断整条流程：退回边缘扩散的结果照样能用
           broadcastLog(`  ✗ ${cut.name} 补图失败: ${err.message}（保留边缘扩散结果）`, 'warning');
+          if (breaker.tripped) {
+            broadcastLog(`  ✗ ${breaker.reason}，已停止补图，剩余部件保留切图原样`, 'warning');
+          }
         }
       }
 
       const secs = ((Date.now() - inpaintReport.startedAt) / 1000).toFixed(1);
       broadcastLog(
-        `✓ 补图完成：${inpaintReport.done} 成功，${inpaintReport.skipped} 无需补，${inpaintReport.failed} 失败，耗时 ${secs}s`,
+        `✓ 补图完成：${inpaintReport.done} 成功（其中 ${inpaintReport.fallbackNames.length} 个平滑兜底），` +
+        `${inpaintReport.skipped} 无需补，${inpaintReport.failed} 失败，耗时 ${secs}s`,
         inpaintReport.failed ? 'warning' : 'success'
       );
     }
@@ -1120,9 +1159,20 @@ app.post('/api/inpaint-retry', async (req, res) => {
     broadcastLog(`开始重跑 ${names.length} 个部件的补图（模型 ${model}）`, 'progress');
     broadcastLog(`切片目录: ${imagesDir}`, 'info');
 
-    const report = { done: 0, skipped: 0, failed: 0, failedNames: [] };
+    const report = { done: 0, skipped: 0, failed: 0, failedNames: [], fallbackNames: [] };
+    const breaker = createInpaintBreaker();
+    /*
+     * 新路径要的画布信息（hiddenPath/hiddenBox/bbox）也由前端带回：它存在 currentCutResults 里。
+     * 没带回来（老前端）就走旧路径。
+     */
+    const cutMap = req.body.cutMap && typeof req.body.cutMap === 'object' ? req.body.cutMap : {};
 
     for (const name of names) {
+      if (breaker.tripped) {
+        report.failed++;
+        report.failedNames.push(basename(String(name)));
+        continue;
+      }
       // 部件名来自前端，必须先夹到 images 目录内，不然 ../ 就能跑到目录外
       const safe = basename(String(name));
       const partPath = join(imagesDir, `${safe}.png`);
@@ -1135,20 +1185,39 @@ app.post('/api/inpaint-retry', async (req, res) => {
       }
 
       try {
+        const c = cutMap[safe];
+        // hiddenPath 来自前端，同样夹回 images 目录内
+        const hiddenPath = c?.hiddenBox && c?.bbox
+          ? (c.hiddenPath ? join(imagesDir, basename(String(c.hiddenPath))) : null)
+          : undefined;
         const r = await inpaintPart(partPath, {
           apiKey, baseURL: baseURL || undefined, model, partName: safe,
           occlusionEdges: occlusionMap[safe],
           maxQualityAttempts: Math.max(1, Math.min(5,
-            Math.round(Number(req.body.maxInpaintAttempts)) || 2))
+            Math.round(Number(req.body.maxInpaintAttempts)) || 2)),
+          ...(hiddenPath !== undefined && {
+            hiddenPath: hiddenPath && existsSync(hiddenPath) ? hiddenPath : null,
+            hiddenBox: c.hiddenBox, partBox: c.bbox,
+            saveRawDir: join(imagesDir, '_inpaint'),
+            // 骨架已按原窗口建好，重跑不能改窗口，否则贴图错位
+            keepWindow: true
+          })
         });
+        if (!r.skipped) breaker.record(null);
         if (r.skipped) {
           report.skipped++;
           broadcastLog(`  ○ ${safe}: ${r.reason}`, 'info');
+        } else if (r.status === 'fallback') {
+          report.done++;
+          report.fallbackNames.push(safe);
+          broadcastLog(`  △ ${safe}: 补图未达标，被挡处改用平滑填色`, 'warning');
         } else {
           report.done++;
-          broadcastLog(`  ✓ ${safe}: 补了 ${(r.coverage * 100).toFixed(0)}% 的面积`, 'info');
+          broadcastLog(`  ✓ ${safe}: ${r.best ? `第 ${r.attempts} 轮合格` : `补了 ${(r.coverage * 100).toFixed(0)}% 的面积`}`, 'info');
         }
       } catch (err) {
+        breaker.record(err);
+        if (breaker.tripped) broadcastLog(`  ✗ ${breaker.reason}，已停止补图`, 'warning');
         report.failed++;
         report.failedNames.push(safe);
         broadcastLog(`  ✗ ${safe} 补图失败: ${err.message}`, 'warning');

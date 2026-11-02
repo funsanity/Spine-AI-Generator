@@ -95,15 +95,18 @@ export async function segmentParts(imagePath, parts, opts = {}) {
     return null;
   }
 
+  // clients 只给测试注入用：真 worker 要装几个 GB 的模型，测合并逻辑用不着
+  const clients = opts.clients ?? {};
+
   if (segmenter === 'sam3') {
-    return segmentWithSam3(imagePath, usable, { onLog, requireEnv });
+    return segmentWithSam3(imagePath, usable, { onLog, requireEnv, clients });
   }
-  return segmentWithMobileSam(imagePath, usable, { onLog, requireEnv });
+  return segmentWithMobileSam(imagePath, usable, { onLog, requireEnv, clients });
 }
 
 /** MobileSAM 路径：框提示，保持原有行为一字不动 */
-async function segmentWithMobileSam(imagePath, usable, { onLog, requireEnv }) {
-  const sam = getSamClient({ onLog });
+async function segmentWithMobileSam(imagePath, usable, { onLog, requireEnv, clients = {}, quiet = false }) {
+  const sam = clients.mobilesam ?? getSamClient({ onLog });
 
   if (!sam.checkEnv()) {
     if (requireEnv) {
@@ -165,7 +168,7 @@ async function segmentWithMobileSam(imagePath, usable, { onLog, requireEnv }) {
       'success'
     );
 
-    if (masks.size < usable.length) {
+    if (masks.size < usable.length && !quiet) {
       const missing = usable
         .filter((p) => !masks.has(p.name))
         .map((p) => p.name).join(', ');
@@ -199,8 +202,8 @@ async function segmentWithMobileSam(imagePath, usable, { onLog, requireEnv }) {
  *   4. **不做覆盖率筛选**。理由见文件上方那段注释 —— 那个指标在文本提示
  *      这条路上是纯粹的误伤源，连很低的兜底下限都会杀掉正确的小部件。
  */
-async function segmentWithSam3(imagePath, usable, { onLog, requireEnv }) {
-  const sam = getSam3Client({ onLog });
+async function segmentWithSam3(imagePath, usable, { onLog, requireEnv, clients = {} }) {
+  const sam = clients.sam3 ?? getSam3Client({ onLog });
 
   if (!sam.checkEnv()) {
     if (requireEnv) {
@@ -219,32 +222,45 @@ async function segmentWithSam3(imagePath, usable, { onLog, requireEnv }) {
     const masks = await sam.segment(imagePath, usable);
     const ms = Date.now() - t0;
 
-    if (!masks.size) {
-      onLog('⚠ 分割没有产出任何掩码，退回多边形轮廓', 'info');
-      return null;
-    }
-
     // 这里**刻意不做筛选**：能进到这个 Map 的掩码都已经过 worker 的
     // 得分门槛（0.5）和 presence 判定，再筛只会误伤小部件。
     // 理由见文件上方关于覆盖率门槛的说明。
 
-    const avgScore = [...masks.values()].reduce((s, m) => s + m.score, 0) / masks.size;
+    const avgScore = masks.size
+      ? [...masks.values()].reduce((s, m) => s + m.score, 0) / masks.size
+      : 0;
     onLog(
       `✓ 分割完成（SAM 3）：${masks.size}/${usable.length} 个部件，` +
       `耗时 ${(ms / 1000).toFixed(1)}s，平均置信度 ${avgScore.toFixed(2)}`,
       'success'
     );
 
-    if (masks.size < usable.length) {
-      const missing = usable
-        .filter((p) => !masks.has(p.name))
-        .map((p) => p.name).join(', ');
-      onLog(`⚠ 这几个部件没切出掩码，将退回多边形轮廓：${missing}`, 'info');
-    }
-
-    return masks;
+    await fillMissingWithMobileSam(imagePath, usable, masks, { onLog, clients });
+    return masks.size ? masks : null;
   } catch (e) {
     onLog(`⚠ 分割失败，退回多边形轮廓：${e.message}`, 'info');
     return null;
   }
+}
+
+/**
+ * SAM 3 没认出的部件，交给 MobileSAM 按框切。
+ *
+ * SAM 3 的提示词就是部件名，`left_upper_arm`、`body` 这种它常常不认：
+ * 用户 2026-11-02 那轮 11 个部件里 5 个「无命中」，全退回 AI 多边形，
+ * body 把白内衬袖子和裤子都圈了进去、left_upper_arm 只剩 2762px。
+ * MobileSAM 有框就能切，比粗多边形准得多；它也拿不到的才真的退回多边形。
+ *
+ * 兜底得来的掩码带 via:'mobilesam'，排查时能分清是谁切的。
+ */
+async function fillMissingWithMobileSam(imagePath, usable, masks, { onLog, clients }) {
+  const missing = usable.filter((p) => !masks.has(p.name) && p.bbox && typeof p.bbox.x === 'number');
+  if (!missing.length) return;
+
+  onLog(`⚠ SAM 3 没认出 ${missing.map((p) => p.name).join(', ')}，改用 MobileSAM 按框分割`, 'info');
+  const extra = await segmentWithMobileSam(imagePath, missing, { onLog, requireEnv: false, clients, quiet: true });
+  for (const [name, m] of extra ?? []) masks.set(name, { ...m, via: 'mobilesam' });
+
+  const still = usable.filter((p) => !masks.has(p.name)).map((p) => p.name);
+  if (still.length) onLog(`⚠ 这几个部件没切出掩码，将退回多边形轮廓：${still.join(', ')}`, 'info');
 }
