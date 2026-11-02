@@ -30,10 +30,15 @@ __pycache__/
 # 这些是查特定问题的一次性脚本，留着复核结论有用，但不是工具的组成部分。
 # 详见 scripts/_debug/README.md
 scripts/_debug/
-temp/
+# 根目录的 test/ 不进仓库。必须带前导斜杠：不加的话会在任意层级匹配，
+# 把 temp/test/（正式测试套件）一起忽略掉
+/test/
 # ── 测试与临时 ─────────────────────────────────────────────────────────
-# temp/ 里 temp/test/ 是**正式测试套件**（npm test 跑的就是它），必须跟踪，
-# 所以不能整目录忽略。下面只挡临时产物。
+# temp/ 里 temp/test/ 是**正式测试套件**（npm test 跑的就是它），必须跟踪；
+# temp/ 下其余的都是排查时生成的图片、日志、一次性脚本，不进仓库。
+# 写成 temp/* + !temp/test/ 而不是 temp/：整目录忽略后 git 不会再往里看，取反不生效
+temp/*
+!temp/test/
 temp/test/tmp/
 temp/*.log
 *.tmp
@@ -61,6 +66,9 @@ Thumbs.db
 # **任意层级**匹配同名目录，把 docs/notes/（正文档）也一起忽略掉。
 /notes/
 /scratch/
+
+# AI 协作过程中生成的设计稿 / 实施计划，不是工具的组成部分
+/docs/superpowers/
 
 # Claude Code 的本机设置（含本机路径与授权记录）
 .claude/settings.local.json
