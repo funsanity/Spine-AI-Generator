@@ -28,6 +28,8 @@
  */
 
 import sharp from 'sharp';
+import { cleanupOwnership } from './ownership-cleanup.js';
+import { penEdge, snapOwnership } from './pen-edge.js';
 import { mkdir } from 'fs/promises';
 import { join } from 'path';
 
@@ -48,6 +50,37 @@ const ALPHA_CUTOFF = 8;
  * 切出来的图又大又脏，还会连带把邻件圈进擦除表。
  */
 const GROW_CAP = 120;
+
+/** SAM 掩码最多可以超出自己的多边形多少像素（见 clipToPolygon） */
+const POLY_SLACK = 15;
+
+/** 方形膨胀（切比雪夫距离 ≤ r）：两遍一维滑窗，O(像素数) */
+function dilateSquare(mask, W, H, r) {
+  const tmp = new Uint8Array(W * H), out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    let cnt = 0;
+    const row = y * W;
+    for (let x = 0; x < Math.min(W, r); x++) cnt += mask[row + x] ? 1 : 0;
+    for (let x = 0; x < W; x++) {
+      if (x + r < W && mask[row + x + r]) cnt++;
+      if (x - r - 1 >= 0 && mask[row + x - r - 1]) cnt--;
+      if (cnt > 0) tmp[row + x] = 1;
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let cnt = 0;
+    for (let y = 0; y < Math.min(H, r); y++) cnt += tmp[y * W + x];
+    for (let y = 0; y < H; y++) {
+      if (y + r < H && tmp[(y + r) * W + x]) cnt++;
+      if (y - r - 1 >= 0 && tmp[(y - r - 1) * W + x]) cnt--;
+      if (cnt > 0) out[y * W + x] = 1;
+    }
+  }
+  return out;
+}
+
+/** 被挡位置掩码的画布：部件窗口四周各外扩这个比例（见 .hidden.png 那段） */
+const HIDDEN_PAD = 0.15;
 
 /**
  * 把 SAM 掩码 PNG 解码成布尔掩码（源图尺寸）。
@@ -494,10 +527,37 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
       return out;
     };
 
+    /*
+     * 再夹到「自己的多边形外扩 POLY_SLACK」以内。
+     *
+     * 框挡得住溢出到框外的，挡不住框内的：手臂和披风的框大片重叠时，
+     * MobileSAM 给手臂的掩码会把披风内侧整片吃进来（实测 kkk right_upper_arm
+     * 带着一大片墨绿披风，补图时模型被要求「保留可见像素」，只好照画）。
+     * 多边形是 AI 按「这个部件的完整形状」描的，粗但不会描到别的部件身上。
+     * 留 15px 余量是因为多边形顶点稀、边是直线：实测 body/left_thigh 落在多边形外
+     * 15px 以内的合法像素各有上千，15px 外只剩几百，而手臂那片披风 15px 外有 4111px。
+     */
+    // 每个带多边形的部件「能认领的范围」= 多边形外扩 POLY_SLACK。SAM 夹边和第三遍框认领共用
+    const nearPoly = new Map();
+    for (const p of parts) {
+      if (Array.isArray(p.polygon) && p.polygon.length >= 3) {
+        nearPoly.set(p.name, dilateSquare(fillPolygon(p.polygon, srcW, srcH, 0, 0), srcW, srcH, POLY_SLACK));
+      }
+    }
+    const mayClaim = (name, i) => !nearPoly.has(name) || !!nearPoly.get(name)[i];
+
+    const clipToPolygon = (name, mask) => {
+      const near = nearPoly.get(name);
+      if (!near) return mask;
+      const out = new Uint8Array(mask.length);
+      for (let i = 0; i < mask.length; i++) if (mask[i] && near[i]) out[i] = 1;
+      return out;
+    };
+
     let contested = 0;
     let clippedOut = 0;
     for (const [name, rawMask] of samMasks) {
-      const mask = clipToBox(name, rawMask);
+      const mask = clipToPolygon(name, clipToBox(name, rawMask));
       let raw = 0;
       for (let i = 0; i < rawMask.length; i++) if (rawMask[i]) raw++;
       let kept = 0;
@@ -516,7 +576,7 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
       }
     }
     if (clippedOut) {
-      console.log(`[切图] ✂ 掩码超出自己的框，已裁掉 ${clippedOut}px（SAM 会外溢到邻件上）`);
+      console.log(`[切图] ✂ 掩码超出自己的框或多边形 ${POLY_SLACK}px 外，已裁掉 ${clippedOut}px（SAM 会外溢到邻件上）`);
     }
     if (contested) {
       console.log(`[切图] ⚖ 掩码重叠 ${contested}px，已按「depth 最大者独占」定归属（避免同一块内容进多张图）`);
@@ -601,11 +661,15 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
           const i = y * srcW + x;
           if (ownerOf[i] !== null) continue;                  // 已有明确归属
           if (srcAlpha[i * 4 + 3] < ALPHA_CUTOFF) continue;   // 源图这儿本来就空
+          // 离自己的多边形太远：框小也不领。SAM 刚因为溢出把这片放掉，
+          // 这里要是按「框最小」再领回去，等于白夹（实测手臂又把披风内侧领了回来）
+          if (!mayClaim(part.name, i)) continue;
 
           // 别的部件用更小的框也圈住了这里？那该归它，不是归我
           let mine = true;
           for (const other of parts) {
             if (other === part || !other.bbox) continue;
+            if (!mayClaim(other.name, i)) continue;
             const o = other.bbox;
             if (x < o.x || y < o.y || x >= o.x + o.width || y >= o.y + o.height) continue;
             if ((boxArea.get(other.name) ?? Infinity) < (boxArea.get(part.name) ?? Infinity)) {
@@ -765,6 +829,31 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
     reseamed += n;
   }
   if (reseamed) console.log(`[切图] ✂ 接缝上 ${reseamed}px 颜色属于后层，还给后层（前层切口不再带一条邻件的颜色）`);
+
+  // 钢笔吸附：前层切口吸到描线外沿（挂错的邻件色还给后层，被切走的描线收回来）。
+  // 在归属表上改而不是在图层上擦：擦掉的那格要靠后层补图盖，补不到就露线
+  if (opts.pen !== false) {
+    const snap = await snapOwnership(ownerOf, srcAlpha, srcW, srcH, depthOf);
+    if (snap.toBehind || snap.toFront) {
+      console.log(`[切图] ✒ 切口吸到描线：${snap.toBehind}px 邻件色还给后层，${snap.toFront}px 描线收回前层`);
+    }
+  }
+
+  // 孤岛和 1px 线头改判给邻件：四遍认领叠出来的边角料，跟错了骨头一动就飘（见 ownership-cleanup.js）
+  const tidy = opts.cleanup === false
+    ? { islandPx: 0, hairPx: 0, moved: new Map(), islands: [] }
+    : cleanupOwnership(ownerOf, srcW, srcH, { rgba: srcAlpha, foreignEdges: opts.foreignEdges !== false });
+  if (tidy.islandPx || tidy.hairPx || tidy.edgePx) {
+    const top = [...tidy.moved].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([n, c]) => `${n} ${c}px`).join('，');
+    console.log(`[切图] ✂ 清理归属：孤岛 ${tidy.islandPx}px、线头 ${tidy.hairPx}px、挂错的邻件边 ${tidy.edgePx ?? 0}px 改判给邻件（主要给了 ${top}）`);
+    for (const e of (tidy.edges ?? []).filter((e) => e.px >= 100).sort((a, b) => b.px - a.px)) {
+      console.log(`[切图]   邻件边 ${e.from} → ${e.to} ${e.px}px`);
+    }
+    // 大块改判单独列出来：碎屑归位是预期的，几百像素以上的整块挪走值得人看一眼
+    for (const i of tidy.islands.filter((i) => i.px >= 300)) {
+      console.log(`[切图]   ${i.from} 的 ${i.px}px（主体的 ${(i.ofLargest * 100).toFixed(0)}%）→ ${i.to}`);
+    }
+  }
 
   const ownsBox = new Map();
   if (growCap > 0) {
@@ -1023,7 +1112,13 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
           else if (d > myDepth) front[i] = 1;
         }
       }
-      const smooth = featherFrontEdge(unmixBackEdge(masked, w, h, mine, front, data), w, h, mine, behind, data);
+      let smooth = featherFrontEdge(unmixBackEdge(masked, w, h, mine, front, data), w, h, mine, behind, data);
+      // 钢笔路径：压着后层的切口描成曲线，抗锯齿往外画一圈（吸附已在归属表上做过）
+      if (opts.pen !== false) {
+        const pen = await penEdge(smooth, w, h, mine, behind, data, { snap: false });
+        smooth = pen.buf;
+        if (pen.anchors) console.log(`[切图] ✒ ${name} 切口 ${pen.anchors} 个锚点`);
+      }
 
       const filled = bleed > 0 ? bleedAlpha(smooth, info.width, info.height, bleed) : smooth;
 
@@ -1031,6 +1126,21 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
       await sharp(filled, { raw: { width: info.width, height: info.height, channels: 4 } })
         .png()
         .toFile(outputPath);
+
+      /*
+       * 归属掩码（.mask.png）：归属表判给本部件的像素，和切图同窗口。
+       * 补图之后 .png 的 alpha 会把补出来的那片也算进去，事后就看不出原来归谁了。
+       */
+      const maskPath = join(outputDir, `${name}.mask.png`);
+      {
+        const mb = Buffer.alloc(w * h * 4);
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            if (ownerOf[(y + y0) * srcW + x + x0] === name) mb[(y * w + x) * 4 + 3] = 255;
+          }
+        }
+        await sharp(mb, { raw: { width: w, height: h, channels: 4 } }).png().toFile(maskPath);
+      }
 
       /*
        * 擦除掩码：alpha 255 = 这一格要补，0 = 不用管。RGB 一律 0。
@@ -1044,6 +1154,55 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
         await sharp(maskBuf, { raw: { width: w, height: h, channels: 4 } })
           .png()
           .toFile(join(outputDir, `${name}.erased.png`));
+      }
+
+      /*
+       * 被挡位置掩码（.hidden.png）：给补图画「完整部件」用。
+       *
+       * 和上面的 erasedMask 有两处不同：
+       *   - 画布四周外扩 15%。被挡的部分可能伸出原窗口——实测用户那轮 body 在披风
+       *     底下的肩颈整片落在窗口上沿之外，窗口不外扩，模型画了也装不下。
+       *   - 不和本部件的 polygon/SAM 求交，只看「被 depth 更大的部件占着」。
+       *     形状交给模型画出来的轮廓决定；求交的话 polygon 划窄了就补不全，
+       *     划宽了就是用户截图里那块按披风形状铺的鼓包。
+       */
+      const padX = Math.round(w * HIDDEN_PAD), padY = Math.round(h * HIDDEN_PAD);
+      const hx0 = Math.max(0, x0 - padX), hy0 = Math.max(0, y0 - padY);
+      const hx1 = Math.min(srcW, x1 + padX), hy1 = Math.min(srcH, y1 + padY);
+      const hw = hx1 - hx0, hh = hy1 - hy0;
+      let hiddenPath = null;
+      {
+        const hb = Buffer.alloc(hw * hh * 4);
+        let n = 0;
+        for (let y = 0; y < hh; y++) {
+          for (let x = 0; x < hw; x++) {
+            const owner = ownerOf[(y + hy0) * srcW + x + hx0];
+            if (owner === null || owner === name) continue;
+            if ((depthOf.get(owner) ?? 0) <= myDepth) continue;
+            hb[(y * hw + x) * 4 + 3] = 255;
+            n++;
+          }
+        }
+        if (n) {
+          hiddenPath = join(outputDir, `${name}.hidden.png`);
+          await sharp(hb, { raw: { width: hw, height: hh, channels: 4 } }).png().toFile(hiddenPath);
+        }
+      }
+
+      /*
+       * SAM 掩码和 AI 多边形的重叠率（IoU），给框偏诊断用。
+       * 两者都是「这个部件长什么样」的独立估计，互相对不上才说明有一方偏了。
+       */
+      let maskPolyIoU = null;
+      if (samMask && hasPoly) {
+        const pm = fillPolygon(poly, srcW, srcH, 0, 0);
+        let inter = 0, uni = 0;
+        for (let i = 0; i < pm.length; i++) {
+          const a = samMask[i] ? 1 : 0, b = pm[i] ? 1 : 0;
+          if (a && b) inter++;
+          if (a || b) uni++;
+        }
+        maskPolyIoU = uni ? +(inter / uni).toFixed(3) : null;
       }
 
       // bbox 左上角挪了多少，pivot 就要往回补多少
@@ -1069,7 +1228,13 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
         contour: usedSam ? 'sam' : (hasPoly ? 'polygon' : 'rect'),
         // 始终带上吸附前的框：snap 关掉时它就是 AI 原框，
         // 开着时是 AI 原框、bbox 是收紧后的。两者的差就是 AI 的误差量
-        originalBbox: { ...rawBbox }
+        originalBbox: { ...rawBbox },
+        maskPath,
+        // 归属掩码和 .erased.png 的窗口。补图会把 bbox 换成补完后的窗口，这里留住切图时的
+        maskBox: { x: x0, y: y0, width: w, height: h },
+        hiddenPath,
+        hiddenBox: { x: hx0, y: hy0, width: hw, height: hh },
+        maskPolyIoU
       });
 
     } catch (error) {
@@ -1385,7 +1550,14 @@ export async function diagnoseAlignment(cutResults) {
 
       // 判定：框里空得离谱，或者吸附把它挪得很多，都值得看一眼
       const flags = [];
-      if (fillRatio < 0.5) flags.push('框内过半是空的，可能框进了邻件或背景');
+      /*
+       * 原来的判据是「框内不透明不到一半」。斜着的肢体天然占不满一个正框：
+       * 双臂张开那张图 11 个部件报了 9 个，全是误报。改看 SAM 掩码和 AI 轮廓
+       * 对不对得上——两份独立估计重叠不到一半，才说明框或分割真的偏了。
+       */
+      if (typeof cut.maskPolyIoU === 'number' && cut.maskPolyIoU < 0.5) {
+        flags.push('SAM 掩码和 AI 轮廓重叠不到一半，框或分割可能偏了');
+      }
       if (drift && (Math.abs(drift.width) > w * 0.3 || Math.abs(drift.height) > h * 0.3)) {
         flags.push('AI 的框比实际内容大很多，已按轮廓收紧');
       }
