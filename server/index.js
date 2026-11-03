@@ -10,7 +10,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { join, dirname, relative, isAbsolute, resolve, basename } from 'path';
 import { fileURLToPath } from 'url';
-import { analyzeImage, classifyImage, DEFAULT_MODEL, REASONING_LEVELS, DEFAULT_MAX_PARTS } from './ai/claude.js';
+import { analyzeImage, classifyImage, DEFAULT_MODEL, REASONING_LEVELS, DEFAULT_MAX_PARTS, CATEGORIES } from './ai/claude.js';
+import { generateMotion, applyMotion, summarizeParts } from './api/motion.js';
 import { listModels } from './ai/models.js';
 import { readApiDefaults } from './ai/api-defaults.js';
 import { SYNC_MODELS, TASK_MODELS, pickImage, describeImageModels, DEFAULT_IMAGE_MODEL } from './ai/image-models.js';
@@ -109,7 +110,9 @@ const STARTED_AT = Date.now();
 
 // 中间件
 app.use(cors());
-app.use(express.json());
+// 骨架整份走 JSON（导出、重算动作）：带了按动作提示词烘出的关键帧后
+// 能到几百 KB，默认 100KB 上限会让导出直接 413
+app.use(express.json({ limit: '50mb' }));
 app.use(express.static(join(__dirname, '../web')));
 // 切好的部件图片要能直接被前端加载，用来在 Canvas 上组装预览
 app.use('/output', express.static(join(__dirname, '../output')));
@@ -691,6 +694,13 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
   try {
     // 前端没填 API 配置时，回退到环境变量 / .env，省得每次都手输
     const prompt = req.body.prompt;
+    // 动作描述：前端勾了「生成动作」时把同一段提示词再发一份过来，拆件完成后
+    // 交给 AI 写时间轴（由模型从里面挑出动作部分）。空着就只出 idle
+    const motionPrompt = String(req.body.motionPrompt ?? '').trim();
+    // 动作名：界面上填的英文名，默认 idle（替换掉呼吸）
+    const motionName = String(req.body.motionName ?? '').trim();
+    // 素材类别：界面上手动选了就以它为准，'auto' 或没传才让 AI 判断
+    const pickedCategory = CATEGORIES.includes(req.body.category) ? req.body.category : null;
     const apiKey = req.body.apiKey || process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
     const baseURL = req.body.baseURL || process.env.ANTHROPIC_BASE_URL;
     // 导出目标决定骨架版本：Cocos 3.8 的内置运行时只认 3.8 格式，
@@ -807,20 +817,20 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     const imageSize = await getImageSize(imagePath);
     broadcastLog(`原图尺寸: ${imageSize.width} x ${imageSize.height}`, 'info');
 
-    // 1. 图片分类（自动识别类别）
-    broadcastLog('正在识别图片类别...', 'progress');
-    const category = await classifyImage(imagePath, {
-      apiKey,
-      baseURL: baseURL || undefined,
-      model
-    });
-    const categoryNames = {
-      character: '角色类',
-      prop: '道具类',
-      effect: '特效类',
-      item: '物品类'
-    };
-    broadcastLog(`✓ 识别为: ${categoryNames[category] || category}`, 'success');
+    // 1. 图片类别：人工选了就不再让 AI 猜（AI 会把结算界面判成物品类）
+    const categoryNames = CATEGORY_NAMES;
+    let category = pickedCategory;
+    if (category) {
+      broadcastLog(`✓ 类别: ${categoryNames[category]}（手动指定）`, 'success');
+    } else {
+      broadcastLog('正在识别图片类别...', 'progress');
+      category = await classifyImage(imagePath, {
+        apiKey,
+        baseURL: baseURL || undefined,
+        model
+      });
+      broadcastLog(`✓ 识别为: ${categoryNames[category] || category}`, 'success');
+    }
 
     // 2. 加载模板并拼接
     let finalPrompt = prompt;
@@ -838,6 +848,9 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
       console.error('[模板] 加载失败:', err);
       // 加载模板失败不应阻塞流程
     }
+    // 拆件和动作共用一段提示词：动作描述对拆件有用（「L 单独盖章」= L 要单独拆），
+    // 但不能让拆件那一步当成规则去执行
+    finalPrompt += '\n\n（用户提示词里可能同时写了动作描述：拆件时只用它判断哪些元素要单独运动、需要单独拆成部件，动画在后面另外生成。）';
 
     // 3. AI 分析图片
     broadcastLog('正在调用 AI 进行图像分析...', 'progress');
@@ -897,7 +910,7 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     });
 
     const cutResults = await cutImageParts(imagePath, analysis.parts, imagesDir,
-      { margin, bleed, snap, samMasks });
+      { margin, bleed, snap, samMasks, halo: !!category && category !== 'character' });
     broadcastLog(`✓ 切图完成：${cutResults.length}/${analysis.parts.length} 张图片`, 'success');
 
     // 轮廓来源统计：让用户看得见这次到底走的哪条路
@@ -996,6 +1009,8 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
             maxQualityAttempts: maxInpaintAttempts,
             // 新路径：模型把部件完整画出来，只取被挡住的那部分（cutter 给了画布才走）
             hiddenPath: cut.hiddenPath, hiddenBox: cut.hiddenBox, partBox: cut.bbox, saveRawDir: rawDir,
+            subject: inpaintSubject(category, prompt),
+            others: cutResults.map((c) => c.name),
             redraw: redraw && cut.name !== BASE_PLATE_NAME
           });
           // 跳过的部件没调接口，不能算「接口恢复了」，否则熔断被它清零
@@ -1052,9 +1067,33 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
 
     // 3. 生成骨骼结构（像素坐标 → Spine 坐标需要原图尺寸）
     broadcastLog('正在生成骨骼结构...', 'progress');
-    const skeleton = generateSkeleton(geom, target.atlasVersion, { imageSize, density });
+    const skeleton = generateSkeleton(geom, target.atlasVersion, { imageSize, density, skin: !category || category === 'character' });
     generateAnimations(skeleton);
-    
+
+    // 3b. 动作提示词 → 时间轴。失败不拖垮整次生成：骨架和 idle 照样能用，
+    // 界面上可以改了描述单独重跑这一步（/api/motion）
+    const motionParts = summarizeParts(geom.parts);
+    let motionReport = null;
+    if (motionPrompt) {
+      broadcastLog('正在按动作提示词生成动画...', 'progress');
+      try {
+        const baked = await generateMotion({
+          parts: motionParts, imageSize, motionPrompt, category, skeleton, name: motionName,
+          apiKey, baseURL, model
+        });
+        if (baked.none) {
+          motionReport = { none: true };
+          broadcastLog('提示词里没有动作描述，保留 idle 呼吸', 'info');
+        } else {
+          applyMotion(skeleton, baked);
+          motionReport = { name: baked.name, duration: baked.duration, warnings: baked.warnings, skipped: baked.skipped };
+          logMotionReport(motionReport);
+        }
+      } catch (err) {
+        motionReport = { error: err.message };
+        broadcastLog(`动作生成失败（保留 idle）：${err.message}`, 'warning');
+      }
+    }
 
     broadcastLog(
       `✓ 骨骼生成完成：${skeleton.bones.length} 个骨骼，${Object.keys(skeleton.animations).length} 个动画`,
@@ -1088,6 +1127,9 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
       bones: skeleton.bones.length,
       slots: skeleton.slots.length,
       animations: Object.keys(skeleton.animations),
+      category,
+      motionParts,
+      motionReport,
       projectDir: workspace.projectDir,
       sourceName,
       sourceDir: workspace.sourceDir,
@@ -1120,6 +1162,56 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     // 没有图片、AI 分析失败…），写在函数末尾会漏掉它们，
     // 结果是"生成过一次失败之后就再也切不了分割器"。
     generating = false;
+  }
+});
+
+const CATEGORY_NAMES = { character: '角色类', prop: '道具类', effect: '特效类', item: '物品类', ui: 'UI动效' };
+
+/** 补图提示词里的素材描述：用户选的类别 + 写的提示词，不写死成某一类 */
+function inpaintSubject(category, prompt) {
+  const kind = CATEGORY_NAMES[category];
+  const text = String(prompt ?? '').trim();
+  return [kind, text].filter(Boolean).join('：');
+}
+
+/** 动作生成结果写进日志：AI 跳过了什么、代码纠正了什么，用户得看得到 */
+function logMotionReport(r) {
+  broadcastLog(`✓ 动作 ${r.name}：${r.duration.toFixed(2)} 秒`, 'success');
+  for (const s of r.skipped ?? []) broadcastLog(`  ○ 跳过「${s.what}」：${s.reason}`, 'info');
+  for (const w of r.warnings ?? []) broadcastLog(`  △ ${w}`, 'warning');
+}
+
+/**
+ * 只重算动作：改了动作描述不用重新拆件、补图。
+ * 骨架由前端带回来（它就是预览里正在播的那份），部件表是生成时回传的 motionParts。
+ */
+app.post('/api/motion', async (req, res) => {
+  try {
+    const { skeleton, parts, imageSize } = req.body ?? {};
+    const motionPrompt = String(req.body?.motionPrompt ?? '').trim();
+    if (!skeleton?.bones?.length) return res.status(400).json({ success: false, error: '没有骨架，先生成一次' });
+    if (!parts?.length || !imageSize?.width) {
+      return res.status(400).json({ success: false, error: '这条记录缺部件信息（旧版本生成的），请重新生成一次' });
+    }
+    if (!motionPrompt) return res.status(400).json({ success: false, error: '请先填写动作提示词' });
+    const category = CATEGORIES.includes(req.body.category) ? req.body.category : null;
+    const apiKey = req.body.apiKey || process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
+    const baseURL = req.body.baseURL || process.env.ANTHROPIC_BASE_URL;
+    broadcastLog('正在按动作提示词重新生成动画...', 'progress');
+    const baked = await generateMotion({
+      parts, imageSize, motionPrompt, category, skeleton, name: String(req.body.motionName ?? '').trim(),
+      apiKey, baseURL, model: req.body.model || DEFAULT_MODEL
+    });
+    if (baked.none) {
+      broadcastLog('提示词里没有动作描述，动作没有改动', 'warning');
+      return res.json({ success: false, error: '提示词里没有找到动作描述（写上时间和怎么动，例如「0–0.5s 皇冠从上方掉落」）' });
+    }
+    const report = { name: baked.name, duration: baked.duration, warnings: baked.warnings, skipped: baked.skipped };
+    logMotionReport(report);
+    res.json({ success: true, name: baked.name, animation: baked.animation, report });
+  } catch (err) {
+    broadcastLog(`✗ 动作生成失败: ${err.message}`, 'error');
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -1204,6 +1296,8 @@ app.post('/api/inpaint-retry', async (req, res) => {
         const r = await inpaintPart(partPath, {
           apiKey, baseURL: baseURL || undefined, model, partName: safe,
           occlusionEdges: occlusionMap[safe],
+          subject: inpaintSubject(CATEGORIES.includes(req.body.category) ? req.body.category : null, req.body.prompt),
+          others: Array.isArray(req.body.partNames) ? req.body.partNames.map(String) : [],
           maxQualityAttempts: Math.max(1, Math.min(5,
             Math.round(Number(req.body.maxInpaintAttempts)) || 2)),
           ...(hiddenPath !== undefined && {

@@ -21,7 +21,8 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import FormData from 'form-data';
 import { join } from 'path';
 import {
-  keyWhiteBackground, softenWhiteEdge, registerModel, warpModel, composeAmodal, scoreAmodal, fallbackFill
+  keyWhiteBackground, softenWhiteEdge, registerModel, warpModel, composeAmodal, scoreAmodal, fallbackFill,
+  modelCanvas, amodalPrompt
 } from './amodal.js';
 import { bleedAlpha } from './cutter.js';
 
@@ -600,6 +601,29 @@ async function readAlphaMask(path, w, h) {
   return m;
 }
 
+/*
+ * 整件重画的结果只留在「原本看得到的地方（外扩 REDRAW_GROW_PX）+ 被挡住的地方」。
+ * 模型被要求把部件画完整时，会往原图里本来空白的地方加东西：2026-11-03 结算图
+ * 「Complete」的框比字宽 280px，模型在两边空位画了一块紫色托盘；「evel」那块被画回了整个「Level」。
+ * 打分只核对可见像素，这些多出来的东西拦不住。外扩几像素是给重画后略变的描边、抗锯齿留余地。
+ */
+const REDRAW_GROW_PX = 3;
+function clipRedraw(model, visible, hidden, W, H) {
+  const keep = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) if (visible[i * 4 + 3] >= ALPHA_CUTOFF || hidden[i]) keep[i] = 1;
+  for (let r = 0; r < REDRAW_GROW_PX; r++) {
+    const prev = keep.slice();
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (prev[y * W + x]) continue;
+      if ((x > 0 && prev[y * W + x - 1]) || (x < W - 1 && prev[y * W + x + 1]) ||
+          (y > 0 && prev[(y - 1) * W + x]) || (y < H - 1 && prev[(y + 1) * W + x])) keep[y * W + x] = 1;
+    }
+  }
+  const out = Buffer.from(model);
+  for (let i = 0; i < W * H; i++) if (!keep[i]) out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = out[i * 4 + 3] = 0;
+  return out;
+}
+
 /**
  * 补图新路径（设计：docs/superpowers/specs/2026-11-02-amodal-part-layers-design.md）。
  *
@@ -618,6 +642,10 @@ async function readAlphaMask(path, w, h) {
 async function inpaintAmodal(pngPath, {
   apiKey, baseURL, model, partName, occlusionEdges, maxQualityAttempts = 2,
   hiddenPath, hiddenBox, partBox, saveRawDir, keepWindow = false,
+  // 用户选的类别 + 写的描述，进补图提示词（不写死成游戏角色）
+  subject = '',
+  // 其他部件名：点名告诉模型它们是单独图层，不许画进这个部件
+  others = [],
   // 实验：整件用模型画的（用户 2026-11-02 觉得 _inpaint 原图比合成结果干净），
   // 没被挡的部件也送去重画；默认关
   redraw = false
@@ -672,27 +700,24 @@ async function inpaintAmodal(pngPath, {
     const bg = stripe ? [255, 0, 255] : [255, 255, 255];
     for (let c = 0; c < 3; c++) img[i * 3 + c] = Math.round(visible[i * 4 + c] * a + bg[c] * (1 - a));
   }
-  const scale = Math.min(1, MAX_EDGE / Math.max(W, H));
-  const reqW = Math.max(16, Math.round((W * scale) / 16) * 16);
-  const reqH = Math.max(16, Math.round((H * scale) / 16) * 16);
-  const imageBuf = await sharp(img, { raw: { width: W, height: H, channels: 3 } })
-    .resize(reqW, reqH, { fit: 'fill' }).ensureAlpha().png().toBuffer();
-  // 蒙版：可见像素保留，其余全部可以画（内部灰度约定，白 = 重画）
+  // 长条部件先补白到模型的出图比例，返回后裁回中间（见 modelCanvas）
+  const { PW, PH, px, py } = modelCanvas(W, H);
+  const pad = { top: py, bottom: PH - H - py, left: px, right: PW - W - px };
+  const scale = Math.min(1, MAX_EDGE / Math.max(PW, PH));
+  const reqW = Math.max(16, Math.round((PW * scale) / 16) * 16);
+  const reqH = Math.max(16, Math.round((PH * scale) / 16) * 16);
+  // 补白和缩放分两步：sharp 一条管线里固定先缩放后补边，和书写顺序无关
+  const imgPadded = await sharp(img, { raw: { width: W, height: H, channels: 3 } })
+    .extend({ ...pad, background: '#ffffff' }).png().toBuffer();
+  const imageBuf = await sharp(imgPadded).resize(reqW, reqH, { fit: 'fill' }).ensureAlpha().png().toBuffer();
+  // 蒙版：可见像素保留，其余全部可以画（内部灰度约定，白 = 重画）。补出来的白边保留，不让模型往外画
   const gray = Buffer.alloc(W * H);
   for (let i = 0; i < W * H; i++) gray[i] = visible[i * 4 + 3] >= 128 ? 0 : 255;
-  const maskBuf = await sharp(gray, { raw: { width: W, height: H, channels: 1 } })
-    .resize(reqW, reqH, { fit: 'fill' }).png().toBuffer();
+  const maskPadded = await sharp(gray, { raw: { width: W, height: H, channels: 1 } })
+    .extend({ ...pad, background: '#000000' }).png().toBuffer();
+  const maskBuf = await sharp(maskPadded).resize(reqW, reqH, { fit: 'fill' }).png().toBuffer();
 
-  const edges = Array.isArray(occlusionEdges) && occlusionEdges.length ? occlusionEdges : [];
-  const prompt = [
-    `This is "${partName}", one part of a 2D game character, cut out and placed on a plain white background.`,
-    'The magenta/white striped areas mark where other parts were covering it.',
-    edges.length ? `It is covered on the ${edges.join(' and ')} side(s).` : '',
-    'Redraw this part COMPLETE and ALONE, as if nothing were in front of it:',
-    'continue its silhouette, outline, folds and texture through the striped areas so the shape closes naturally.',
-    'Keep the existing pixels, art style, pose, scale and position exactly.',
-    'Pure white background, no shadow, no other body parts, no magenta.'
-  ].filter(Boolean).join(' ');
+  const prompt = amodalPrompt({ partName, occlusionEdges, subject, others });
 
   const qMax = Math.max(1, Math.min(5, Math.round(maxQualityAttempts) || 2));
   let best = null;
@@ -716,13 +741,17 @@ async function inpaintAmodal(pngPath, {
      * 先用 sharp 按面积缩回画布大小再抠、再配准：配准时的双线性采样一次只看 4 个点，
      * 直接从 3~8 倍大的图上采，边缘会丢细节、起锯齿。
      */
-    const m = await sharp(out).flatten({ background: '#ffffff' })
-      .resize(W, H, { fit: 'fill' }).raw().toBuffer({ resolveWithObject: true });
+    // 先缩回补白后的画布，再裁掉补的白边。分两步：sharp 一条管线里 resize 和 extract 的先后不由书写顺序定
+    const padded = await sharp(out).flatten({ background: '#ffffff' })
+      .resize(PW, PH, { fit: 'fill' }).raw().toBuffer({ resolveWithObject: true });
+    const m = { data: cropRaw(padded.data, PW, padded.info.channels, px, py, W, H), info: { width: W, height: H } };
     const mw = m.info.width, mh = m.info.height;
     const alpha = keyWhiteBackground(m.data, mw, mh);
     const meta = await sharp(out).metadata();
     if (meta.hasAlpha) {
-      const own = await sharp(out).ensureAlpha().extractChannel(3).resize(W, H, { fit: 'fill' }).raw().toBuffer();
+      const ownPadded = await sharp(out).ensureAlpha().extractChannel(3).resize(PW, PH, { fit: 'fill' })
+        .raw().toBuffer({ resolveWithObject: true });
+      const own = cropRaw(ownPadded.data, PW, ownPadded.info.channels, px, py, W, H);
       for (let i = 0; i < mw * mh; i++) if (own[i] < alpha[i]) alpha[i] = own[i];
     }
     // 缩小后轮廓上混进了白底：拆成半透明 + 部件原色，不然拼到深色上一圈白边
@@ -750,7 +779,7 @@ async function inpaintAmodal(pngPath, {
   // 没有一轮达到严格线时，略差但轮廓对得上的最好一轮也比兜底好
   const chosen = bestOk ?? bestUsable;
   if (chosen) {
-    rgba = redraw ? chosen.warped : composeAmodal({ visible, hidden, model: chosen.warped, w: W, h: H });
+    rgba = redraw ? clipRedraw(chosen.warped, visible, hidden, W, H) : composeAmodal({ visible, hidden, model: chosen.warped, w: W, h: H });
     status = 'done';
   } else {
     // 没有一轮合格：明显画错的内容不进切图，在部件轮廓内用边缘色平滑补上（用户要的「光滑些」）
@@ -788,6 +817,16 @@ async function inpaintAmodal(pngPath, {
     best: best ? { cost: best.score.cost, coverage: best.score.coverage, magentaFrac: best.score.magentaFrac } : null,
     coverage: hidden.reduce((s, v) => s + v, 0) / (W * H)
   };
+}
+
+/**
+ * 从 raw 像素里裁一块。不用 sharp 的 extract：单通道 raw 进去、裁完出来会变成 3 通道，
+ * 按 1 通道索引就全错位（补白画布裁回原画布时踩过）。
+ */
+function cropRaw(buf, srcW, ch, x0, y0, w, h) {
+  const out = Buffer.alloc(w * h * ch);
+  for (let y = 0; y < h; y++) buf.copy(out, y * w * ch, ((y + y0) * srcW + x0) * ch, ((y + y0) * srcW + x0 + w) * ch);
+  return out;
 }
 
 /** 旧路径：没有被挡掩码时（老调用方、旧测试）按透明区补 */

@@ -320,6 +320,54 @@ export function composeAmodal({ visible, hidden, model, w, h, band = 3 }) {
   return out;
 }
 
+/**
+ * 送模型的画布补白成模型出图的比例。
+ *
+ * 图像模型只按几档固定比例出图（1:1、3:2、2:3），内容按**自己的比例**放进去。
+ * 人物部件本来就在 1:1~1:2 之间，拉回原画布几乎不变形；横幅、标题字这种 4:1~6:1 的长条，
+ * 拉回来高度只剩一半（2026-11-03 结算图实测：横幅 2634x412 被画回 2635x211，
+ * 可见像素只盖住 51%，三轮全不合格，走了平滑填色兜底）。
+ * 先在短边两侧补白到 3:2（或 2:3），模型返回后按同样比例缩放、裁回中间那块，形状就不变。
+ *
+ * @returns {{ PW, PH, px, py }} 补白后的画布尺寸，原画布在里面的偏移
+ */
+export const MODEL_MAX_ASPECT = 1.5;
+export function modelCanvas(W, H) {
+  let PW = W, PH = H;
+  if (W / H > MODEL_MAX_ASPECT) PH = Math.ceil(W / MODEL_MAX_ASPECT);
+  else if (H / W > MODEL_MAX_ASPECT) PW = Math.ceil(H / MODEL_MAX_ASPECT);
+  return { PW, PH, px: Math.floor((PW - W) / 2), py: Math.floor((PH - H) / 2) };
+}
+
+/**
+ * 补图提示词。素材是什么由用户决定（类别 + 提示词），不写死成「游戏角色」：
+ * 横幅被当成角色的一部分去画，模型会往人体上靠（垫子被画成了蝙蝠翼）。
+ *
+ * 描述里会提到别的元素（「横幅上有 Complete 两行字」），模型就会把它们一起画进来
+ * （实测横幅被画回整行 Complete，可见像素照样对得上、打分发现不了）。
+ * 所以把其他部件点名列出来：它们是单独的图层，这里不许画。
+ *
+ * @param {object} o - { partName, occlusionEdges, subject, others }
+ *   subject：用户选的类别和写的描述；others：其他部件名
+ */
+export function amodalPrompt({ partName, occlusionEdges, subject, others }) {
+  const edges = Array.isArray(occlusionEdges) && occlusionEdges.length ? occlusionEdges : [];
+  const what = String(subject ?? '').trim();
+  const rest = (Array.isArray(others) ? others : []).filter((n) => n && n !== partName && !String(n).startsWith('_'));
+  return [
+    `This is "${partName}", one separate element cut out of a 2D game art asset and placed on a plain white background.`,
+    what ? `The whole asset is described by the user as: "${what.slice(0, 400)}".` : '',
+    'The magenta/white striped areas mark where other elements were covering it.',
+    edges.length ? `It is covered on the ${edges.join(' and ')} side(s).` : '',
+    rest.length ? `These other elements are separate layers and must NOT be drawn here: ${rest.join(', ')}.` : '',
+    'Redraw this element COMPLETE and ALONE, as if nothing were in front of it:',
+    'continue its silhouette, outline, pattern and texture through the striped areas so the shape closes naturally.',
+    'Keep the existing pixels, art style, proportions, scale and position exactly.',
+    'Do not add any text, letters or objects that are not already part of this element.',
+    'Pure white background, no shadow, no other elements, no magenta.'
+  ].filter(Boolean).join(' ');
+}
+
 /** 质量门（设计 B.6）：配准色差、模型轮廓对可见像素的覆盖、洋红残留 */
 /*
  * softMaxCost：没有一轮达到 maxCost 时，色差 ≤ 它且轮廓对得上的最好一轮照样用。

@@ -252,6 +252,39 @@ textarea {
   font-family: inherit;
 }
 
+/* 动作提示词那一行：左边开关，右边动作名 */
+/* 标签和控件放同一行（素材类别只是个短下拉，占两行浪费地方） */
+.form-group.inline-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.form-group.inline-field label { margin-bottom: 0; }
+
+.motion-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0 6px;
+}
+.motion-head .toggle { margin: 0; font-weight: 500; }
+.motion-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.motion-name input {
+  width: 120px;
+  padding: 4px 8px;
+  font-family: 'SF Mono', ui-monospace, monospace;
+}
+.motion-name input:invalid { border-color: #e5484d; }
+.motion-name input:disabled { opacity: 0.5; }
+
+
 .hint {
   font-size: 0.85em;
   color: var(--text-muted);
@@ -264,7 +297,8 @@ textarea {
   padding: 16px;
   text-align: center;
   cursor: pointer;
-  transition: all 0.3s;
+  /* 不过渡 height：拖高度时会一顿一顿地追鼠标 */
+  transition: border-color 0.3s, background-color 0.3s;
   /*
    * 淡灰底 + 浅棋盘格。
    *
@@ -286,6 +320,27 @@ textarea {
 .upload-area:hover {
   border-color: var(--primary);
   background-color: #ececec;
+}
+
+/*
+ * 有图时上传框可以拖右下角改高度，图不跟着放大：保持原来按宽度放下的大小，
+ * 在框里居中；框压矮了才跟着缩，保证整张图始终看得全。
+ * grid 居中是一开始就开着的：拖动中途 display 一变，Chrome 会把这次拖动
+ * 掐断（只长 50px 就停），所以不能等拖了才切。
+ */
+.upload-area.has-image {
+  display: grid;
+  /* 行高跟框走，图的 max-height:100% 才有参照；不写的话行按图撑开，压矮了图不缩 */
+  grid-template-rows: minmax(0, 1fr);
+  place-items: center;
+  resize: vertical;
+  overflow: hidden;
+  min-height: 160px;
+  max-height: 90vh;
+}
+
+.upload-area.has-image.sized .preview-image {
+  max-height: 100%;
 }
 
 .upload-placeholder svg {
@@ -387,6 +442,10 @@ textarea {
   position: relative;
   width: 100%;
   height: 600px;
+  /* 右下角拖动改高度：横长的素材在 600px 里太小。上限是一屏高，再往下拉不动 */
+  resize: vertical;
+  min-height: 320px;
+  max-height: 90vh;
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;

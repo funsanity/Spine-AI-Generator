@@ -55,12 +55,37 @@
             <span>2. 提示词</span>
             <button type="button" id="promptSettingsBtn" class="btn-mini">模板设置</button>
           </h3>
+          <!-- 类别决定套哪份拆件模板。AI 自动判断会把结算界面判成物品类，人看一眼更准 -->
+          <div class="form-group inline-field">
+            <label for="categorySelect">素材类别</label>
+            <select id="categorySelect">
+              <option value="auto">自动识别</option>
+              <option value="character">角色类</option>
+              <option value="prop">道具类</option>
+              <option value="effect">特效类</option>
+              <option value="item">物品类</option>
+              <option value="ui">UI动效</option>
+            </select>
+          </div>
+          <!--
+            拆件说明和动作描述写在同一个框里：拆件那一步拿它判断哪些元素要单独拆，
+            动作那一步由模型自己挑出讲「怎么动」的部分。分成两个框用户嫌输入太多
+          -->
           <textarea
             id="prompt"
-            rows="3"
-            placeholder="例如：这是一个机械手臂，需要分成上臂、前臂、手掌三个部件，上臂是根部件"
+            rows="5"
+            placeholder="例如：结算界面，横幅是根部件，皇冠坐在垫子上，字母 L 单独一块。&#10;0–0.5s 皇冠从上方掉到垫子上弹两下；0.3–0.6s L 从 1.5 倍盖章落下；1.5–2.1s 两支号角前后吹两下"
           ></textarea>
-          <p class="hint">描述部件结构和层级关系</p>
+          <p class="hint">描述部件结构和层级关系；要做动作就接着按时间写每个部件怎么动</p>
+          <div class="motion-head">
+            <label class="toggle"><input type="checkbox" id="motionToggle"> 按提示词生成动作</label>
+            <!-- disabled 写死在 HTML 里：开关默认不勾，等会话恢复完再由 syncMotionToggle 按记忆的状态放开 -->
+            <label class="motion-name">动作名
+              <input type="text" id="motionName" value="idle" maxlength="32" disabled pattern="[A-Za-z0-9_-]+"
+                     placeholder="idle" spellcheck="false" autocomplete="off">
+            </label>
+          </div>
+          <p class="hint">勾选后由模型从提示词里挑出动作描述生成关键帧，没写动作就保留 idle 呼吸。动作名用英文（引擎按它调动画），填 idle 会替换默认的呼吸。图里没有的东西（彩纸、光效）做不出来</p>
         </section>
 
         <section class="form-section">
@@ -293,6 +318,7 @@
                 <option value="">选择动画</option>
               </select>
             </div>
+            <button id="regenMotionBtn" class="btn-small" type="button" disabled title="按左侧提示词里的动作描述重新生成动作，不重新拆件">🎬 重新生成动作</button>
             <div class="tweak-group">
               <label for="scaleSlider">缩放</label>
               <input type="range" id="scaleSlider" min="0.1" max="4" step="0.05" value="1">
@@ -451,6 +477,7 @@
           <button class="template-tab" data-category="prop">道具类</button>
           <button class="template-tab" data-category="effect">特效类</button>
           <button class="template-tab" data-category="item">物品类</button>
+          <button class="template-tab" data-category="ui">UI动效</button>
         </div>
         <p class="template-description" id="templateDescription"></p>
         <textarea 

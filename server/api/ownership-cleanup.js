@@ -176,6 +176,13 @@ function removeIslands(ownerOf, width, height, minIslandFrac, moved, islands, rg
  * 描边、阴影这种两边都有的暗色分不出「更像谁」，不动。
  */
 const BAND_PX = 4;
+/*
+ * 前层的外发光、投影、描边外沿是画在后层上的，比切口误差宽得多：
+ * 2026-11-03 结算图 Complete 那行字，横幅上像字的像素一直延到离字 12px，13px 起回到底噪。
+ * 只有「后层身上像前层」这个方向放宽——反方向是前层挂了后层的边，那仍是切口误差。
+ */
+const HALO_BAND_PX = 24;
+const HALO_MIN_CORE = 0.25;
 const SPUR_R = 2;
 const SPUR_MIN_PX = 6;
 const FOREIGN_RATIO = 2;
@@ -200,7 +207,7 @@ function openMask(mask, w, h, r) {
   return pass(pass(eroded, true, true), false, true);
 }
 
-function removeForeignEdges(ownerOf, width, height, moved, rgba, edges) {
+function removeForeignEdges(ownerOf, width, height, moved, rgba, edges, depthOf) {
   const boxes = new Map();
   for (let i = 0; i < ownerOf.length; i++) {
     const o = ownerOf[i];
@@ -210,17 +217,64 @@ function removeForeignEdges(ownerOf, width, height, moved, rgba, edges) {
     if (!b) boxes.set(o, { x0: x, y0: y, x1: x, y1: y });
     else { if (x < b.x0) b.x0 = x; if (x > b.x1) b.x1 = x; if (y < b.y0) b.y0 = y; if (y > b.y1) b.y1 = y; }
   }
-  const hists = new Map();
-  const histOf = (o) => {
-    if (!hists.has(o)) {
-      const px = [];
-      for (let i = 0; i < ownerOf.length; i++) if (ownerOf[i] === o) px.push(i);
-      hists.set(o, histogram(rgba, px));
+  /*
+   * 本来面目不到自己 1/4 的（整个部件都贴着前层的小件）分布不可靠，照旧只按 4px 带子处理，
+   * 不然一个小件身上凡是像前层的颜色都会被吸走。
+   */
+  const sizes = new Map();
+  for (const o of ownerOf) if (o !== null) sizes.set(o, (sizes.get(o) ?? 0) + 1);
+  const isHalo = (own, other) => !!depthOf && (depthOf.get(other) ?? 0) > (depthOf.get(own) ?? 0)
+    && coreOf(own).length >= (sizes.get(own) ?? 0) * HALO_MIN_CORE;
+  /*
+   * 后层的「本来面目」：离任何前层超过 HALO_BAND_PX 的那些像素。
+   * 前层的发光挂在后层上时，按后层全部像素算分布，挂着的发光色也算进了「自己常见」——
+   * 结算图横幅上几行字的蓝边加起来上万像素，字的蓝色在横幅分布里就不稀罕了，2 倍判据过不去。
+   * 只在后层对前层这个方向用；其余方向照旧按全部像素算。
+   */
+  const cores = new Map();
+  const coreOf = (o) => {
+    if (cores.has(o)) return cores.get(o);
+    const d0 = depthOf.get(o) ?? 0;
+    const near = new Uint8Array(ownerOf.length);
+    let frontier = [];
+    for (let i = 0; i < ownerOf.length; i++) {
+      const n = ownerOf[i];
+      if (n === null || n === o || (depthOf.get(n) ?? 0) <= d0) continue;
+      frontier.push(i);
     }
-    return hists.get(o);
+    for (let d = 0; d < HALO_BAND_PX && frontier.length; d++) {
+      const next = [];
+      for (const i of frontier) {
+        const x = i % width, y = (i / width) | 0;
+        for (const [dx, dy] of N8) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const k = ny * width + nx;
+          if (ownerOf[k] === o && !near[k]) { near[k] = 1; next.push(k); }
+        }
+      }
+      frontier = next;
+    }
+    const px = [];
+    for (let i = 0; i < ownerOf.length; i++) if (ownerOf[i] === o && !near[i]) px.push(i);
+    cores.set(o, px);
+    return px;
+  };
+  const hists = new Map();
+  const histOf = (o, core = false) => {
+    const key = core ? `${o}\0core` : o;
+    if (!hists.has(key)) {
+      let px = core ? coreOf(o) : null;
+      if (!px) {
+        px = [];
+        for (let i = 0; i < ownerOf.length; i++) if (ownerOf[i] === o) px.push(i);
+      }
+      hists.set(key, histogram(rgba, px));
+    }
+    return hists.get(key);
   };
   const ratioOk = (k, own, other) => {
-    const pb = histOf(other)[k], pa = histOf(own)[k];
+    const pb = histOf(other)[k], pa = histOf(own, isHalo(own, other))[k];
     return pb > 0.002 && pb > pa * FOREIGN_RATIO;
   };
   /*
@@ -229,22 +283,26 @@ function removeForeignEdges(ownerOf, width, height, moved, rgba, edges) {
    *   不该吸的：模板让黄短袖归手臂，13.7%
    * 暗色不数：描边、腰带、阴影两边都大量有，算进来黄边那例被撑到 11.2%，和黄短袖分不开。
    * 不按色档邻域看：黄色暗部和肘部皮肤阴影挨着，一算就被皮肤撑大。
+   * 后层对前层也只数本来面目那部分：挂着的发光本身不能算成「自己大片拥有」。
    */
   const shares = new Map();
   const foreignShare = (own, other) => {
     const key = `${own}→${other}`;
     if (!shares.has(key)) {
+      const halo = isHalo(own, other);
       let n = 0, hit = 0;
-      for (let i = 0; i < ownerOf.length; i++) {
-        if (ownerOf[i] !== own) continue;
+      const count = (i) => {
         n++;
-        if (Math.max(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]) < 80) continue;
+        if (Math.max(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]) < 80) return;
         if (ratioOk(bin(rgba, i), own, other)) hit++;
-      }
+      };
+      if (halo) for (const i of coreOf(own)) count(i);
+      else for (let i = 0; i < ownerOf.length; i++) if (ownerOf[i] === own) count(i);
       shares.set(key, n ? hit / n : 0);
     }
     return shares.get(key);
   };
+  const bandOf = (own, other) => (isHalo(own, other) ? HALO_BAND_PX : BAND_PX);
   const looksLike = (i, own, other) => ratioOk(bin(rgba, i), own, other) && foreignShare(own, other) < OWN_COLOR_MAX;
 
   const changes = [];
@@ -284,7 +342,7 @@ function removeForeignEdges(ownerOf, width, height, moved, rgba, edges) {
           const k = ny * width + nx;
           if (ownerOf[k] !== o || claim.has(k)) continue;
           const spur = !opened[toLocal(k)];
-          if (d + 1 > BAND_PX && !spur) continue;
+          if (d + 1 > bandOf(o, to) && !spur) continue;
           if (!looksLike(k, o, to)) continue;
           claim.set(k, to); depth.set(k, d + 1); next.push(k);
         }
@@ -325,10 +383,11 @@ function removeForeignEdges(ownerOf, width, height, moved, rgba, edges) {
 /**
  * @param {Array<string|null>} ownerOf - 源图尺寸的归属表，原地修改
  * @param {object} [opts.rgba] - 源图 RGBA；给了才对大孤岛做颜色判断
+ * @param {Map<string, number>} [opts.depthOf] - 部件深度（大的在前）；给了才把前层的发光/投影整圈还给前层
  * @returns {{ islandPx: number, hairPx: number, edgePx: number, edges: Array<{from,to,px}>, moved: Map<string, number>, islands: Array }}
  *   moved：每个部件因清理**新得到**的像素数；islands：每块被改判的孤岛 {from, to, px, ofLargest}
  */
-export function cleanupOwnership(ownerOf, width, height, { minIslandFrac = 0.15, rgba = null, foreignEdges = true } = {}) {
+export function cleanupOwnership(ownerOf, width, height, { minIslandFrac = 0.15, rgba = null, foreignEdges = true, depthOf = null } = {}) {
   const moved = new Map();
   // 先线头后孤岛：线头切断后，原来靠一根细线连着主体的小块才露出孤岛的真面目
   const hairPx = removeHairs(ownerOf, width, height, moved);
@@ -336,7 +395,7 @@ export function cleanupOwnership(ownerOf, width, height, { minIslandFrac = 0.15,
   const islandPx = removeIslands(ownerOf, width, height, minIslandFrac, moved, islands, rgba);
   // 挂错的邻件边只能靠颜色判，没给源图颜色就不做
   const edges = [];
-  const edgePx = rgba && foreignEdges ? removeForeignEdges(ownerOf, width, height, moved, rgba, edges) : 0;
+  const edgePx = rgba && foreignEdges ? removeForeignEdges(ownerOf, width, height, moved, rgba, edges, depthOf) : 0;
   /*
    * 邻件边吸走后，带子里颜色判不出的那几颗（描边像素）会被孤立出来：再清一遍。
    * 这回先孤岛后线头：被孤立的那颗是 1px 孤岛；先跑线头的话，它下面刚吸走的那颗

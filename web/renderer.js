@@ -134,8 +134,9 @@ export class SpinePreview {
     this.time = 0;
 
     // 动画时长 = 所有轨道最后一个关键帧时间的最大值
+    // 槽位颜色轨道也算：淡出常常是整段动画的最后一步，漏了会提前回绕
     let duration = 0;
-    for (const track of Object.values(this.animation.bones ?? {})) {
+    for (const track of [...Object.values(this.animation.bones ?? {}), ...Object.values(this.animation.slots ?? {})]) {
       for (const keys of Object.values(track)) {
         for (const k of keys) {
           if (k.time > duration) duration = k.time;
@@ -285,9 +286,12 @@ export class SpinePreview {
       // canvas 从 display:none 变成 block 时，首帧 clientWidth 可能仍是 0
       // （布局还没刷新），导致 resize() 把画布算成 0x0，内容永远画不出来。
       // 只要发现宽度变了就重新 resize，不会带来额外开销。
+      // 高度也要看：预览区可以拖动改高度，宽度不变
       const curW = this.canvas?.clientWidth ?? 0;
-      if (curW !== this._lastKnownW) {
+      const curH = this.canvas?.clientHeight ?? 0;
+      if (curW !== this._lastKnownW || curH !== this._lastKnownH) {
         this._lastKnownW = curW;
+        this._lastKnownH = curH;
         this.resize();
       }
       this.draw();
@@ -371,6 +375,18 @@ export class SpinePreview {
       }
     }
     return keys[keys.length - 1].value;
+  }
+
+  /**
+   * 槽位在当前时刻的不透明度。颜色轨道 4.x 叫 rgba、3.8 叫 color，值是 rrggbbaa，
+   * 这里只取 alpha；没有轨道就是不透明。
+   */
+  slotAlpha(slotName) {
+    const track = this.animation?.slots?.[slotName];
+    const keys = track?.rgba ?? track?.color;
+    if (!keys?.length) return 1;
+    const a = keys.map((k) => ({ time: k.time ?? 0, value: parseInt(String(k.color).slice(6, 8) || 'ff', 16) / 255 }));
+    return Math.max(0, Math.min(1, SpinePreview.sample(a, this.time)));
   }
 
   /** 取出某个骨骼在某个时刻的变换 */
@@ -468,8 +484,13 @@ export class SpinePreview {
       const img = this.images.get(slot.bone);
       if (!img) continue;
 
+      const alpha = this.slotAlpha(slot.name);
+      if (alpha <= 0) continue;
+      ctx.globalAlpha = alpha;
+
       if (attachment?.type === 'mesh') {
         this.drawMesh(attachment, slot, world, img, toScreen);
+        ctx.globalAlpha = 1;
         continue;
       }
 
@@ -487,6 +508,7 @@ export class SpinePreview {
       ctx.transform(scale * bone.a, -scale * bone.c, -scale * bone.b, scale * bone.d, screen.x, screen.y);
       ctx.drawImage(img, -img.width / 2, -img.height / 2, img.width, img.height);
       ctx.restore();
+      ctx.globalAlpha = 1;
     }
 
     // 骨骼叠加层，标出每根骨骼的原点并连出父子关系。

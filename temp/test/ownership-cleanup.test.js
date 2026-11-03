@@ -201,3 +201,76 @@ test('自己大片拥有的颜色（归手臂的黄短袖）不当挂错的邻�
   cleanupOwnership(t, W, H, { rgba });
   for (const y of [10, 11, 12, 13]) assert.equal(t[y * W + 15], 'arm', `(15,${y}) 被吸回了上衣`);
 });
+
+/*
+ * 2026-11-03 结算图实测：Complete 那行字的蓝描边外沿、投影、外发光有 10 多像素宽，
+ * 切口只吃到字身，那圈留在了横幅上——横幅补完字以后，中间一圈蓝边和淡色晕。
+ * 4px 的邻件边带子只吸回了里面那截。
+ * 发光和投影是**前层**画在后层上的：后层挨着前层、颜色像前层的那圈，带子放宽还给前层；
+ * 后层让出来的地方由补图重画。反方向（前层身上像后层的颜色）仍然只动 4px。
+ */
+const GW = 240, GH = 140;
+function glowScene() {
+  const PURPLE = [120, 70, 200], PINK = [250, 170, 210], BLUE = [40, 110, 230];
+  // 字：x 100..139, y 60..79，外 3px 是自己的蓝描边；横幅：其余全部，字外 1..10px 是字的蓝色外沿
+  const inText = (x, y) => x >= 100 && x < 140 && y >= 60 && y < 80;
+  const ring = (x, y) => Math.max(100 - x, x - 139, 60 - y, y - 79);
+  const t = [], rgba = Buffer.alloc(GW * GH * 4);
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    const i = y * GW + x;
+    t.push(inText(x, y) ? 'text' : 'banner');
+    const d = ring(x, y);
+    const c = inText(x, y) ? (d > -3 ? BLUE : PINK) : d <= 10 ? BLUE : PURPLE;
+    rgba.set([...c, 255], i * 4);
+  }
+  return { t, rgba };
+}
+
+test('前层的外发光/投影留在后层上（字的蓝边挂在横幅上 10px 宽）→ 整圈还给前层', () => {
+  const { t, rgba } = glowScene();
+  cleanupOwnership(t, GW, GH, { rgba, depthOf: new Map([['banner', 0], ['text', 3]]) });
+  assert.equal(t[70 * GW + 98], 'text', '离字 2px');
+  assert.equal(t[70 * GW + 92], 'text', '离字 8px：4px 带子够不到');
+  assert.equal(t[70 * GW + 90], 'text', '离字 10px');
+  assert.equal(t[70 * GW + 85], 'banner', '外沿以外的紫色横幅不动');
+});
+
+test('没有深度、或者挂着的是后层的颜色：带子仍是 4px（人物部件的老行为不变）', () => {
+  const a = glowScene();
+  cleanupOwnership(a.t, GW, GH, { rgba: a.rgba });
+  assert.equal(a.t[70 * GW + 92], 'banner', '不给深度时照旧只吸 4px');
+  const b = glowScene();
+  cleanupOwnership(b.t, GW, GH, { rgba: b.rgba, depthOf: new Map([['banner', 3], ['text', 0]]) });
+  assert.equal(b.t[70 * GW + 92], 'banner', '字在横幅后面时，横幅身上那圈不是字的发光');
+});
+
+test('后层身上挂的发光很多时（几个字的蓝边加起来），后层的颜色分布按远离前层的部分算', () => {
+  // 蓝色外沿占横幅 ~15%：按整个横幅算，蓝色就成了横幅「自己大片拥有」的颜色，旧判据一口不吸
+  const PURPLE = [120, 70, 200], PINK = [250, 170, 210], BLUE = [40, 110, 230];
+  const w = 120, h = 80;
+  const inText = (x, y) => x >= 45 && x < 75 && y >= 30 && y < 50;
+  const ring = (x, y) => Math.max(45 - x, x - 74, 30 - y, y - 49);
+  const t = [], px = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    t.push(inText(x, y) ? 'text' : 'banner');
+    const d = ring(x, y);
+    px.set([...(inText(x, y) ? (d > -3 ? BLUE : PINK) : d <= 10 ? BLUE : PURPLE), 255], (y * w + x) * 4);
+  }
+  cleanupOwnership(t, w, h, { rgba: px, depthOf: new Map([['banner', 0], ['text', 3]]) });
+  assert.equal(t[40 * w + 41], 'text', '离字 4px');
+  assert.equal(t[40 * w + 37], 'text', '离字 8px');
+  assert.equal(t[40 * w + 25], 'banner');
+});
+
+test('整个都贴着前层的小件（离前层全在发光带子里），不按发光处理，只动 4px', () => {
+  // 小件 12px 宽，紧挨前层；颜色和前层一样，但它就是自己的内容
+  const BLUE = [40, 110, 230];
+  const w = 60, h = 40;
+  const t = [], px = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    t.push(x < 30 ? 'front' : x < 42 && y >= 10 && y < 30 ? 'small' : null);
+    px.set([...BLUE, t[t.length - 1] ? 255 : 0], (y * w + x) * 4);
+  }
+  cleanupOwnership(t, w, h, { rgba: px, depthOf: new Map([['small', 0], ['front', 2]]) });
+  assert.equal(t[20 * w + 38], 'small', '离前层 8px 的像素是小件自己的');
+});

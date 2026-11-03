@@ -840,9 +840,11 @@ export async function cutImageParts(sourcePath, parts, outputDir, opts = {}) {
   }
 
   // 孤岛和 1px 线头改判给邻件：四遍认领叠出来的边角料，跟错了骨头一动就飘（见 ownership-cleanup.js）
+  // opts.halo：前层的发光/投影整圈还给前层（UI、特效这类带外发光的素材）。
+  // 角色不开：kkk 实测放宽后上臂皮肤被前臂吸走、腿的描边挂到靴子上，人物切图保持原样
   const tidy = opts.cleanup === false
     ? { islandPx: 0, hairPx: 0, moved: new Map(), islands: [] }
-    : cleanupOwnership(ownerOf, srcW, srcH, { rgba: srcAlpha, foreignEdges: opts.foreignEdges !== false });
+    : cleanupOwnership(ownerOf, srcW, srcH, { rgba: srcAlpha, foreignEdges: opts.foreignEdges !== false, depthOf: opts.halo ? depthOf : null });
   if (tidy.islandPx || tidy.hairPx || tidy.edgePx) {
     const top = [...tidy.moved].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([n, c]) => `${n} ${c}px`).join('，');
     console.log(`[切图] ✂ 清理归属：孤岛 ${tidy.islandPx}px、线头 ${tidy.hairPx}px、挂错的邻件边 ${tidy.edgePx ?? 0}px 改判给邻件（主要给了 ${top}）`);

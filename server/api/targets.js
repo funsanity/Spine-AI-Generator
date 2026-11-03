@@ -268,7 +268,21 @@ function convertAnimations(animations, rotateKey) {
       if (Object.keys(converted).length) bones[boneName] = converted;
     }
 
-    out[animName] = { bones };
+    /*
+     * 槽位颜色（动作提示词里的淡入淡出）。键名按版本换：3.8 叫 color，4.x 叫 rgba，
+     * 写错的那边运行时直接忽略，部件就一直不透明。
+     */
+    const colorKey = rotateKey === 'angle' ? 'color' : 'rgba';
+    const slots = {};
+    for (const [slotName, track] of Object.entries(anim.slots ?? {})) {
+      const keys = track.rgba ?? track.color;
+      if (!keys?.length) continue;
+      slots[slotName] = {
+        [colorKey]: keys.map((k) => ({ time: +(k.time ?? 0).toFixed(4), color: k.color }))
+      };
+    }
+
+    out[animName] = Object.keys(slots).length ? { bones, slots } : { bones };
   }
 
   return out;

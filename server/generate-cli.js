@@ -100,7 +100,7 @@ async function main() {
   });
 
   const cutResults = await cutImageParts(SOURCE, analysis.parts, imagesDir,
-    { margin: MARGIN, bleed: BLEED, snap: SNAP, samMasks });
+    { margin: MARGIN, bleed: BLEED, snap: SNAP, samMasks, halo: !!category && category !== 'character' });
   console.log(`[生成] 切图: ${cutResults.length}`);
 
   // 底板：接住没有任何部件认领的源图像素（见 api/baseplate.js）。
@@ -135,7 +135,7 @@ async function main() {
     ? [basePlatePart(meta.width, meta.height), ...analysis.parts]
     : analysis.parts;
   const skeleton = generateSkeleton({ ...analysis, parts: partsWithBase }, '3.8',
-    { imageSize: { width: meta.width, height: meta.height }, density: 8 });
+    { imageSize: { width: meta.width, height: meta.height }, density: 8, skin: !category || category === 'character' });
   generateAnimations(skeleton);
 
   writeFileSync(join(outputDir, `${sourceName}.json`), JSON.stringify(skeleton, null, 2));

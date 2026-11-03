@@ -67,6 +67,12 @@ let currentFile = null;
  */
 let currentSourceName = '';
 
+// 生成时回传的部件表（名字、父子、外框、轴心），「重新生成动作」要拿它给 AI。
+// 载入现成 Spine 文件时没有它，那种情况下不能重算动作
+let currentMotionParts = null;
+// 本次实际用的类别（手动指定或 AI 识别），重算动作时按它决定约束
+let currentCategory = null;
+
 // DOM 元素
 const uploadArea = document.getElementById('uploadArea');
 const fileInput = document.getElementById('fileInput');
@@ -549,13 +555,13 @@ loadApiDefaults().then(loadApiConfig);
 
 // 这几个字段刷新后要保持原样。id 同时用作存储键，省掉一层映射。
 const TRACKED_INPUTS = [
-  'prompt', 'modelSelect', 'reasoningSelect', 'exportTarget',
+  'prompt', 'categorySelect', 'motionName', 'modelSelect', 'reasoningSelect', 'exportTarget',
   'outputDir', 'projectName',
   'densityInput', 'marginInput', 'bleedInput', 'imageModelSelect', 'maxInpaintInput', 'maxPartsInput'
 ];
 
 // 复选框的状态在 .checked 上，不在 .value 上，得分开存取
-const TRACKED_TOGGLES = ['cleanToggle', 'inpaintToggle', 'redrawToggle', 'tightCutToggle', 'snapToggle', 'backgroundToggle', 'samToggle'];
+const TRACKED_TOGGLES = ['motionToggle', 'cleanToggle', 'inpaintToggle', 'redrawToggle', 'tightCutToggle', 'snapToggle', 'backgroundToggle', 'samToggle'];
 
 /*
  * 分割器单选组的存储键。
@@ -959,6 +965,7 @@ function addLog(message, type = 'info') {
  */
 async function restoreSession() {
   const saved = restoreInputs();
+  syncMotionToggle();
 
   const stored = await loadFile();
   if (stored) {
@@ -969,6 +976,7 @@ async function restoreSession() {
       handleImageSelect(stored.file);
     } else {
       previewImg.style.display = 'none';
+      setUploadHasImage(false);
       document.querySelector('.upload-placeholder').style.display = 'none';
     }
   }
@@ -980,6 +988,8 @@ async function restoreSession() {
     // 子目录名也在结果里存了一份：刷新后文件名可能已经取不到（localStorage 被清过），
     // 但补图和导出还得指回原来那个目录
     if (result.sourceName) currentSourceName = result.sourceName;
+    currentMotionParts = result.motionParts ?? null;
+    currentCategory = result.category ?? null;
     // 切图产物还在 output 目录里，URL 和上次一致，直接重新组装预览
     const imageUrls = new Map(result.imageUrls ?? []);
     await displaySkeletonInfo(result.skeleton, imageUrls, result.imageSize, result.alignment ?? null);
@@ -1027,6 +1037,7 @@ document.getElementById('clearSessionBtn')?.addEventListener('click', async () =
 
   document.getElementById('prompt').value = '';
   previewImg.style.display = 'none';
+  setUploadHasImage(false);
   previewImg.src = '';
   const placeholder = document.querySelector('.upload-placeholder');
   if (placeholder) placeholder.style.display = '';
@@ -1226,8 +1237,52 @@ window.addEventListener('resize', () => {
   if (preview) preview.resize();
 });
 
+// 预览区拖动改过的高度要记住；存储不可用（隐私模式）时就用默认高度
+{
+  const area = document.getElementById('previewArea');
+  try {
+    const h = parseInt(localStorage.getItem('previewHeight'), 10);
+    if (h > 0) area.style.height = `${h}px`;
+  } catch {}
+  new ResizeObserver(() => {
+    if (!area.style.height) return;   // 只记用户拖过的
+    try { localStorage.setItem('previewHeight', String(Math.round(area.getBoundingClientRect().height))); } catch {}
+  }).observe(area);
+}
+
+// 上传框有图时可拖高度（见 styles.css .upload-area.has-image）；拖过的高度记住
+let uploadResizing = false;
+{
+  try {
+    const h = parseInt(localStorage.getItem('uploadHeight'), 10);
+    if (h > 0) {
+      uploadArea.style.height = `${h}px`;
+      uploadArea.classList.add('sized');
+    }
+  } catch {}
+  new ResizeObserver(() => {
+    if (!uploadArea.style.height) return;   // 只记用户拖过的
+    uploadArea.classList.add('sized');
+    try { localStorage.setItem('uploadHeight', String(Math.round(uploadArea.getBoundingClientRect().height))); } catch {}
+  }).observe(uploadArea);
+  // 按在右下角拖手上是在拖高度，松手那下的 click 不能弹出选文件
+  uploadArea.addEventListener('pointerdown', (e) => {
+    const r = uploadArea.getBoundingClientRect();
+    uploadResizing = uploadArea.classList.contains('has-image') && r.right - e.clientX < 20 && r.bottom - e.clientY < 20;
+  });
+}
+
+// 有图才能拖高度；没图时框按占位内容自适应
+function setUploadHasImage(on) {
+  uploadArea.classList.toggle('has-image', on);
+}
+
 // 初始化上传区域
 uploadArea.addEventListener('click', () => {
+  if (uploadResizing) {
+    uploadResizing = false;
+    return;
+  }
   fileInput.click();
 });
 
@@ -1300,6 +1355,7 @@ function handleImageSelect(file) {
   reader.onload = (e) => {
     previewImg.src = e.target.result;
     previewImg.style.display = 'block';
+    setUploadHasImage(true);
     document.querySelector('.upload-placeholder').style.display = 'none';
   };
   reader.readAsDataURL(file);
@@ -1313,6 +1369,7 @@ async function handleSpineFile(file) {
 
     // 隐藏图片预览，显示 Spine canvas
     previewImg.style.display = 'none';
+    setUploadHasImage(false);
     document.querySelector('.upload-placeholder').style.display = 'none';
 
     // 显示 Spine 预览（需要完整的资源才能渲染）
@@ -1321,6 +1378,8 @@ async function handleSpineFile(file) {
     // 载入的是一个现成的 Spine 文件，没有切图也就没有对齐诊断数据。
     // 不清掉的话，诊断框会停留在上一次生成的坐标上，看着像这个骨架的
     currentAlignment = null;
+    // 现成的 Spine 文件没有部件表，不能按提示词重算动作
+    currentMotionParts = null;
 
     // 显示骨骼信息
     displaySkeletonInfo(skeletonData);
@@ -1522,6 +1581,13 @@ generateBtn.addEventListener('click', async () => {
   const formData = new FormData();
   formData.append('image', file);
   formData.append('prompt', prompt);
+  formData.append('category', document.getElementById('categorySelect').value);
+  // 勾了「按提示词生成动作」才把同一段提示词再交给动作那一步（由模型挑出动作描述）；
+  // 不勾就只出 idle 呼吸，也省一次 AI 调用
+  if (motionEnabled()) {
+    formData.append('motionPrompt', prompt);
+    formData.append('motionName', motionNameValue());
+  }
   formData.append('apiKey', apiKey);
   formData.append('baseURL', baseURL);
   formData.append('outputDir', outputDir);
@@ -1563,6 +1629,11 @@ generateBtn.addEventListener('click', async () => {
       currentCutResults = result.cutResults ?? [];
       // 服务端规范化后的名字才是准的（大小写、非法字符都处理过），以它为准
       currentSourceName = result.sourceName || currentSourceName;
+      currentMotionParts = result.motionParts ?? null;
+      currentCategory = result.category ?? null;
+      if (result.motionReport?.error) {
+        addLog(`动作生成失败，先用 idle：${result.motionReport.error}。可改描述后点「重新生成动作」`, 'warning');
+      }
 
       /*
        * 补图有几个部件失败时，把「重跑失败部件」露出来。
@@ -1605,6 +1676,8 @@ generateBtn.addEventListener('click', async () => {
           sourceName: currentSourceName,
           cutResults: currentCutResults,
           alignment: result.alignment ?? null,
+          motionParts: currentMotionParts,
+          category: currentCategory,
           savedAt: Date.now()
         });
 
@@ -1761,6 +1834,92 @@ animationSelect.addEventListener('change', (e) => {
   }
 });
 
+// --- 动作提示词开关与动作名 ---
+// 都在函数里现查 DOM：会话恢复在模块求值早期就会调 syncMotionToggle，
+// 那时写在这里的 const 还没初始化
+function motionEnabled() {
+  return !!document.getElementById('motionToggle')?.checked;
+}
+/** 动作名只收英文、数字、_ 和 -（引擎按名字调动画）；空着就是 idle */
+function motionNameValue() {
+  const v = (document.getElementById('motionName')?.value ?? '').trim().replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32);
+  return v || 'idle';
+}
+/** 没勾选时输入框置灰、「重新生成动作」不可点，一眼看出这次不会出提示词动作 */
+function syncMotionToggle() {
+  const on = motionEnabled();
+  const nameInput = document.getElementById('motionName');
+  if (nameInput) nameInput.disabled = !on;
+  const btn = document.getElementById('regenMotionBtn');
+  if (btn) {
+    btn.disabled = !on;
+    btn.title = on ? '按左侧提示词里的动作描述重新生成动作，不重新拆件' : '先勾选「按提示词生成动作」';
+  }
+}
+document.getElementById('motionToggle')?.addEventListener('change', syncMotionToggle);
+// 失焦时把非法字符规范掉再存，下次打开看到的就是实际会用的名字
+document.getElementById('motionName')?.addEventListener('blur', (e) => {
+  e.target.value = motionNameValue();
+  persistInputs();
+});
+
+/**
+ * 只重算动作：拆件、补图都不动，改完描述几秒钟就能看到新动作。
+ * 旧的提示词动作整个换掉（不叠加），idle 保留。
+ */
+const regenMotionBtn = document.getElementById('regenMotionBtn');
+regenMotionBtn?.addEventListener('click', async () => {
+  const motionPrompt = document.getElementById('prompt').value.trim();
+  if (!currentSkeleton) return showStatus('❌ 还没有骨架，先生成一次', 'error');
+  if (!currentMotionParts?.length) {
+    return showStatus('❌ 这份骨架没有部件信息（载入的文件或旧记录），请重新生成一次', 'error');
+  }
+  if (!motionEnabled()) return showStatus('❌ 请先勾选「按提示词生成动作」', 'error');
+  if (!motionPrompt) return showStatus('❌ 请先在左侧提示词里写上动作描述', 'error');
+  persistInputs();
+  regenMotionBtn.disabled = true;
+  regenMotionBtn.textContent = '⏳ 生成动作中...';
+  try {
+    const picked = document.getElementById('categorySelect').value;
+    const res = await fetch('/api/motion', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        skeleton: currentSkeleton,
+        parts: currentMotionParts,
+        imageSize: currentImageSize,
+        motionPrompt,
+        motionName: motionNameValue(),
+        category: picked !== 'auto' ? picked : currentCategory,
+        apiKey: apiKeyInput.value.trim(),
+        baseURL: baseURLInput.value.trim(),
+        model: document.getElementById('modelSelect').value
+      })
+    });
+    const data = await readJson(res, '生成动作');
+    if (!data.success) throw new Error(data.error);
+    // 只留 idle 呼吸。新动作本身就叫 idle 时连它也不留——展开写在后面，同名会把新动作盖回呼吸
+    const kept = Object.fromEntries(Object.entries(currentSkeleton.animations ?? {})
+      .filter(([n]) => n === 'idle' && n !== data.name));
+    currentSkeleton.animations = { [data.name]: data.animation, ...kept };
+    const anims = Object.keys(currentSkeleton.animations);
+    animationSelect.innerHTML = anims.map((n) => `<option value="${n}">${n}</option>`).join('');
+    animationSelect.value = data.name;
+    preview?.playAnimation(data.name);
+    preview?.play();
+    playPauseBtn.textContent = '❚❚';
+    const saved = await loadResult();
+    if (saved) await saveResult({ ...saved, skeleton: currentSkeleton, savedAt: Date.now() });
+    const extra = data.report.skipped?.length ? `，跳过 ${data.report.skipped.length} 项（见日志）` : '';
+    showStatus(`✅ 动作 ${data.name} 已生成（${data.report.duration.toFixed(2)} 秒${extra}）`, 'success');
+  } catch (err) {
+    showStatus(`❌ 动作生成失败: ${err.message}`, 'error');
+  } finally {
+    regenMotionBtn.textContent = '🎬 重新生成动作';
+    syncMotionToggle();
+  }
+});
+
 resetViewBtn.addEventListener('click', () => {
   scaleSlider.value = 1;
   scaleValue.textContent = '1.00x';
@@ -1782,6 +1941,9 @@ previewArea?.addEventListener('wheel', (e) => {
 let dragging = null;
 previewArea?.addEventListener('pointerdown', (e) => {
   if (!preview || e.target.closest('.tweak-controls')) return;
+  // 右下角是改高度的拖动手柄：这里抓住指针的话浏览器的拖动就失效了
+  const r = previewArea.getBoundingClientRect();
+  if (r.right - e.clientX < 20 && r.bottom - e.clientY < 20) return;
   dragging = { x: e.clientX, y: e.clientY, panX: preview.panX, panY: preview.panY };
   previewArea.setPointerCapture?.(e.pointerId);
 });
@@ -1891,7 +2053,9 @@ async function pushHistory(file, result, imageUrls) {
       projectDir: result.projectDir,
       // 载入记录时靠它找回 output/<工程名>/<输入图名>/ 那一层
       sourceName: result.sourceName ?? currentSourceName,
-      cutResults: result.cutResults ?? []
+      cutResults: result.cutResults ?? [],
+      motionParts: result.motionParts ?? null,
+      category: result.category ?? null
     }
   };
 
@@ -2034,6 +2198,7 @@ async function injectHistory(id) {
   }
   syncParamLabels();
   syncSectionSummaries();
+  syncMotionToggle();
   persistInputs();
 
   // 原图。必须同时清掉 file input：生成时优先取 fileInput.files[0]，
@@ -2049,6 +2214,7 @@ async function injectHistory(id) {
       handleImageSelect(currentFile);
     } else {
       previewImg.style.display = 'none';
+      setUploadHasImage(false);
       document.querySelector('.upload-placeholder').style.display = 'none';
     }
   }
@@ -2059,6 +2225,8 @@ async function injectHistory(id) {
     // 老记录没有 sourceName 字段，用文件名推——推不出来就退回工程名，
     // 和服务端的默认规则一致
     if (entry.result.sourceName) currentSourceName = entry.result.sourceName;
+    currentMotionParts = entry.result.motionParts ?? null;
+    currentCategory = entry.result.category ?? null;
     const imageUrls = new Map(entry.result.imageUrls ?? []);
     await displaySkeletonInfo(
       entry.result.skeleton,
@@ -2110,6 +2278,11 @@ retryInpaintBtn?.addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         names: failedInpaintNames,
+        // 补图提示词要知道这是什么素材（类别 + 用户写的描述），和首次生成一致
+        category: currentCategory,
+        prompt: document.getElementById('prompt').value.trim(),
+        // 全部部件名：补图提示词要点名「这些是别的图层，不许画进来」
+        partNames: (currentCutResults ?? []).map((c) => c.name),
         // 遮挡方向存在前端 currentCutResults 里，服务端没留存，得带回去，
         // 否则重跑退化成无定向补图，和首次生成效果不一致
         occlusionMap: Object.fromEntries(

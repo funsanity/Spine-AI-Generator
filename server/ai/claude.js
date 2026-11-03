@@ -647,15 +647,25 @@ const CLASSIFICATION_PROMPT = `请判断这张图片属于以下哪个类别：
 1. character - 角色类：游戏角色、NPC、宠物等人形或动物角色
 2. prop - 道具类：武器、工具、载具等机械器具
 3. effect - 特效类：爆炸、光效、粒子、魔法阵等视觉效果
-4. item - 物品类：场景物件、UI元素、静态装饰等
+4. item - 物品类：场景物件、宝箱、静态装饰等
+5. ui - UI 动效类：结算/胜利界面、弹窗、横幅、按钮、标题文字等界面元素
 
-只输出类别的英文代号（character/prop/effect/item），不要任何解释。`;
+只输出类别的英文代号（character/prop/effect/item/ui），不要任何解释。`;
+
+/** 所有类别代号。界面上的手动选择、模板文件的键都以它为准 */
+export const CATEGORIES = ['character', 'prop', 'effect', 'item', 'ui'];
+
+/** 从分类回复里取类别代号，认不出时按角色类处理（角色类模板约束最严） */
+export function parseCategory(text) {
+  const match = String(text ?? '').toLowerCase().match(/\b(character|prop|effect|item|ui)\b/);
+  return match ? match[1] : 'character';
+}
 
 /**
  * 对上传的图片进行分类
  * @param {string} imagePath - 图片路径
  * @param {object} options - { apiKey, baseURL, model }
- * @returns {Promise<string>} 类别代号 (character/prop/effect/item)
+ * @returns {Promise<string>} 类别代号 (character/prop/effect/item/ui)
  */
 export async function classifyImage(imagePath, options) {
   const { apiKey, baseURL } = options;
@@ -695,11 +705,7 @@ export async function classifyImage(imagePath, options) {
       }]
     });
 
-    const text = responseText(response).trim().toLowerCase();
-    
-    // 提取类别代号（去掉可能的多余字符）
-    const match = text.match(/\b(character|prop|effect|item)\b/);
-    const category = match ? match[1] : 'character'; // 默认角色类
+    const category = parseCategory(responseText(response));
 
     console.log(`[AI] 识别结果: ${category}`);
     return category;

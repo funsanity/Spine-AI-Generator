@@ -158,7 +158,10 @@ export function generateSkeleton(analysis, spineVersion = '4.0', options = {}) {
     // 根部件没有可混合的对象，保持 region 即可。
     const parentPart = part.parent ? parts.find((p) => p.name === part.parent) : null;
 
-    if (shouldSkin(part, parentPart)) {
+    // options.skin === false：界面/特效类部件各自独立，不和父部件共享权重。
+    // 共享权重是给人物关节藏接缝的；UI 元素一缩放、一滑入，绑在父骨骼上的那半不跟着动，整张图被扯变形
+    // （2026-11-03 结算图「Complete」盖章、号角滑入都被扯歪）
+    if (options.skin !== false && shouldSkin(part, parentPart)) {
       const mesh = buildSkinnedMesh(part, parentPart, { density });
 
       // 部件自身骨骼是 boneIndex 1，父骨骼是 0，这里转成骨骼名

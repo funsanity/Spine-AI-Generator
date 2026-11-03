@@ -19,16 +19,18 @@ const PART = [210, 140, 60];
 
 function startRelay(mode) {
   const calls = [];
+  const prompts = [];
   const server = http.createServer((req, res) => {
     const files = {};
     const bb = Busboy({ headers: req.headers });
+    bb.on('field', (name, val) => { if (name === 'prompt') prompts.push(val); });
     bb.on('file', (name, stream) => { const c = []; stream.on('data', (d) => c.push(d)); stream.on('end', () => { files[name] = Buffer.concat(c); }); });
     bb.on('close', async () => {
       calls.push(1);
       const { data, info } = await sharp(files.image).removeAlpha().raw().toBuffer({ resolveWithObject: true });
       const w = info.width, h = info.height;
       const out = Buffer.alloc(w * h * 3, 255);
-      if (mode === 'draw' || mode === 'draw-big' || mode === 'draw-transparent' || mode === 'tinted') {
+      if (mode === 'draw' || mode === 'draw-big' || mode === 'draw-transparent' || mode === 'tinted' || mode === 'fixed-aspect' || mode === 'plaque') {
         const magenta = (i) => data[i * 3] > 200 && data[i * 3 + 1] < 60 && data[i * 3 + 2] > 200;
         const SHIFT = 6;
         for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -42,8 +44,10 @@ function startRelay(mode) {
           const isBg = data[i * 3] > 245 && data[i * 3 + 1] > 245 && data[i * 3 + 2] > 245 && !hid;
           // 往左挪：被挡区贴着画布右边，往右挪会把最后几列挤出图外，等于模型真没画
           const X = x - SHIFT;
-          if (X < 0 || isBg) continue;
+          if (X < 0) continue;
           const o = (y * w + X) * 3;
+          // plaque：整件重画时模型在空白处凭空加了一块托盘（2026-11-03「Complete」后面多出紫色椭圆）
+          if (isBg) { if (mode === 'plaque') { out[o] = 120; out[o + 1] = 60; out[o + 2] = 200; } continue; }
           // 透明底那个模式更像真模型：部件形状只占被挡区上半，下半留背景
           if (hid && mode === 'draw-transparent' && y > h * 0.55) continue;
           if (hid) { out[o] = PART[0]; out[o + 1] = PART[1]; out[o + 2] = PART[2]; }
@@ -67,16 +71,21 @@ function startRelay(mode) {
       }
       // big：真模型按自己的固定档位出图（实测 1000~1600px），比画布大好几倍
       if (mode === 'draw-big') png = await sharp(png).resize(w * 3, h * 3).png().toBuffer();
+      // fixed-aspect：真模型只按固定档位出图（1536x1024 等），内容保持自己的比例放进去、四周留白。
+      // 送一张 6:1 的横幅进去，回来是 3:2 的图，中间一条是横幅（2026-11-03 结算图实测横幅被压扁一半）
+      if (mode === 'fixed-aspect') {
+        png = await sharp(png).resize(1536, 1024, { fit: 'contain', background: '#ffffff' }).png().toBuffer();
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ data: [{ b64_json: png.toString('base64') }] }));
     });
     req.pipe(bb);
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () =>
-    resolve({ server, calls, baseURL: `http://127.0.0.1:${server.address().port}` })));
+    resolve({ server, calls, prompts, baseURL: `http://127.0.0.1:${server.address().port}` })));
 }
 
-let dir, drawRelay, whiteRelay, clearRelay, tintRelay, bigRelay;
+let dir, drawRelay, whiteRelay, clearRelay, tintRelay, bigRelay, aspectRelay, plaqueRelay;
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'spine-amodal-'));
   drawRelay = await startRelay('draw');
@@ -84,9 +93,11 @@ before(async () => {
   clearRelay = await startRelay('draw-transparent');
   tintRelay = await startRelay('tinted');
   bigRelay = await startRelay('draw-big');
+  aspectRelay = await startRelay('fixed-aspect');
+  plaqueRelay = await startRelay('plaque');
 });
 after(async () => {
-  drawRelay.server.close(); whiteRelay.server.close(); clearRelay.server.close(); tintRelay.server.close(); bigRelay.server.close();
+  drawRelay.server.close(); whiteRelay.server.close(); clearRelay.server.close(); tintRelay.server.close(); bigRelay.server.close(); aspectRelay.server.close(); plaqueRelay.server.close();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -233,4 +244,90 @@ test('没有一轮达到严格线，但最好一轮只是略差：用它，不�
   const r = await inpaintPart(s.pngPath, opts(tintRelay, s));
   assert.ok(r.best.cost > 25 && r.best.cost <= 40, `假模型色差 ${r.best.cost} 应落在 25..40`);
   assert.equal(r.status, 'done', JSON.stringify(r));
+});
+
+/**
+ * 长条部件（横幅 6:1）：中间一段被文字盖着。画布 = 窗口四周外扩 6px。
+ * 模型按 3:2 出图时，送过去的画布必须先补白成模型的比例，否则拉回来高度只剩一半。
+ */
+async function bannerScene(tag) {
+  const W = 300, H = 50;
+  const part = Buffer.alloc(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (x >= 140 && x < 170) continue;
+    const i = (y * W + x) * 4;
+    const c = (((x / 10) | 0) + ((y / 10) | 0)) % 2;
+    part[i] = c ? 230 : 120; part[i + 1] = c ? 120 : 200; part[i + 2] = c ? 40 : 90; part[i + 3] = 255;
+  }
+  const pngPath = join(dir, `${tag}.png`);
+  await sharp(part, { raw: { width: W, height: H, channels: 4 } }).png().toFile(pngPath);
+  const hb = { x: 94, y: 94, width: 312, height: 62 };
+  const hidden = Buffer.alloc(hb.width * hb.height * 4);
+  for (let y = 0; y < hb.height; y++) for (let x = 0; x < hb.width; x++) {
+    const sx = x + hb.x, sy = y + hb.y;
+    if (sx >= 240 && sx < 270 && sy >= 100 && sy < 150) hidden[(y * hb.width + x) * 4 + 3] = 255;
+  }
+  const hiddenPath = join(dir, `${tag}.hidden.png`);
+  await sharp(hidden, { raw: { width: hb.width, height: hb.height, channels: 4 } }).png().toFile(hiddenPath);
+  const erased = Buffer.alloc(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 140; x < 170; x++) erased[(y * W + x) * 4 + 3] = 255;
+  await sharp(erased, { raw: { width: W, height: H, channels: 4 } }).png().toFile(join(dir, `${tag}.erased.png`));
+  return { pngPath, hiddenPath, hiddenBox: hb, partBox: { x: 100, y: 100, width: W, height: H }, part };
+}
+
+test('长条部件：模型按固定比例出图也不会被压扁，被挡处按模型画的补上', async () => {
+  const s = await bannerScene('banner');
+  const r = await inpaintPart(s.pngPath, opts(aspectRelay, s));
+  assert.equal(r.status, 'done', JSON.stringify(r));
+  assert.ok(r.best.coverage >= 0.95, `可见像素覆盖 ${r.best.coverage}`);
+  const { data, info } = await sharp(s.pngPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const at = (sx, sy) => { const i = ((sy - r.bbox.y) * info.width + (sx - r.bbox.x)) * 4; return [...data.subarray(i, i + 4)]; };
+  for (const sy of [102, 125, 147]) {
+    const px = at(255, sy);
+    assert.equal(px[3], 255, `被挡处 (255,${sy}) 补上了`);
+    assert.ok(Math.abs(px[0] - PART[0]) < 30 && Math.abs(px[1] - PART[1]) < 30, `被挡处颜色 ${px}`);
+  }
+});
+
+test('补图提示词按用户的素材描述写，不写死「游戏角色」', async () => {
+  const s = await scene('subject');
+  const n = drawRelay.prompts.length;
+  await inpaintPart(s.pngPath, opts(drawRelay, s, { subject: 'UI动效：结算界面，横幅是根部件' }));
+  const p = drawRelay.prompts[n];
+  assert.match(p, /结算界面/);
+  assert.doesNotMatch(p, /character/i);
+  // 没给描述时也不默认成角色
+  const s2 = await scene('subject2');
+  await inpaintPart(s2.pngPath, opts(drawRelay, s2));
+  assert.doesNotMatch(drawRelay.prompts[n + 1], /character/i);
+});
+
+test('补图提示词点名其他部件是单独图层、不许画进来（横幅里被画回了 Complete 那行字）', async () => {
+  const s = await scene('others');
+  const n = drawRelay.prompts.length;
+  await inpaintPart(s.pngPath, opts(drawRelay, s, {
+    subject: 'UI动效：横幅上有 Level 和 Complete 两行字', others: ['text_Complete', 'cushion', 'body']
+  }));
+  const p = drawRelay.prompts[n];
+  assert.match(p, /text_Complete/);
+  assert.match(p, /cushion/);
+  assert.match(p, /must NOT|do not/i);
+  // 自己不在「不许画」的名单里
+  assert.doesNotMatch(p.split(/must NOT/i)[1] ?? '', /\bbody\b/);
+});
+
+test('整件重画：模型在原图空白处多画的东西不进切图（「Complete」后面凭空多了一块托盘）', async () => {
+  const s = await scene('plaque');
+  const r = await inpaintPart(s.pngPath, opts(plaqueRelay, s, { redraw: true }));
+  assert.equal(r.status, 'done', JSON.stringify(r));
+  const { data, info } = await sharp(s.pngPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const alphaAt = (sx, sy) => {
+    const x = sx - r.bbox.x, y = sy - r.bbox.y;
+    if (x < 0 || y < 0 || x >= info.width || y >= info.height) return 0;
+    return data[(y * info.width + x) * 4 + 3];
+  };
+  assert.equal(alphaAt(130, 140), 255, '可见处保留');
+  assert.equal(alphaAt(175, 140), 255, '被挡处补上');
+  assert.equal(alphaAt(92, 140), 0, '窗口左边原本是空白，模型画的托盘不要');
+  assert.equal(alphaAt(130, 92), 0, '窗口上方原本是空白');
 });
