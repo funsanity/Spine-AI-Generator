@@ -23,6 +23,8 @@
   <img src="docs/images/parts-sheet.png" width="100%" alt="部件拆解：左边原图，右边每个部件按流程排五格——归属蒙版、被擦除、被遮挡、模型补画、最终部件">
 </p>
 
+<p align="center"><a href="docs/images/">更多例子 →</a></p>
+
 ---
 
 ## 目录

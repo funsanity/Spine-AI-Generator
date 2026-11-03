@@ -23,6 +23,8 @@ cutout → bone hierarchy is inferred → one click exports Spine assets for you
   <img src="docs/images/parts-sheet.png" width="100%" alt="Layer breakdown: source on the left; each part shows ownership mask, erased, hidden, model drawing and final part">
 </p>
 
+<p align="center"><a href="docs/images/">More examples →</a></p>
+
 ---
 
 ## Contents
