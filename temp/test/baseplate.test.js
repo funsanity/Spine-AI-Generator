@@ -137,8 +137,10 @@ test('洞的掩码只标「源图有内容、被部件拿走」的地方，不�
   const s = await alphaOf(src.path);
 
   let marked = 0, markedOnBackground = 0;
+  // 补图按 alpha 读擦除掩码（inpaint.js：eb[i*4+3] > 127），和 cutter 写的 .erased.png 同一格式。
+  // 只看 RGB 的话，alpha 全 255 的旧写法会让补图把整张画布当洞，模型就整张重画
   for (let i = 0; i < info.width * info.height; i++) {
-    if (data[i * 4] <= 127) continue;
+    if (data[i * 4 + 3] <= 127) continue;
     marked++;
     if (!s.a[i]) markedOnBackground++;
   }

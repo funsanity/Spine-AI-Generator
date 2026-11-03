@@ -2,31 +2,36 @@
 //   归属蒙版 → 被擦除 → 被遮挡 → 模型补画 → 最终部件
 // 五格按原图坐标对齐（同一张卡片里同一个比例尺），所以能直接看出补的那片落在哪。
 //
-// 用法：node scripts/parts-sheet.mjs <response.json> [原图] [输出]
-//   response.json 是 /api/generate 的完整响应（或 temp/fullrun.mjs 写的那份），
+// 用法：node scripts/parts-sheet.mjs <_temp 目录 | response.json> [原图] [输出]
+//   response.json 是 /api/generate 的完整响应（每次生成都会存在 _temp 目录里），
 //   要用里面 cutResults 的 maskBox / hiddenBox / bbox 定位每张图。
+// 只想看最终部件、不要中间层，用 parts-grid.mjs。
 import sharp from 'sharp';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const respPath = process.argv[2];
-const srcPath = process.argv[3] ?? 'test_assets/kkk.png';
-const outPath = process.argv[4] ?? 'docs/images/parts-sheet.png';
-if (!respPath) {
-  console.error('用法：node scripts/parts-sheet.mjs <response.json> [原图] [输出]');
+// 第一个参数可以是 response.json，也可以是一次生成的 _temp 目录——
+// 服务每次生成都会在那里留 response.json 和切图用的 source.png
+const arg = process.argv[2];
+if (!arg) {
+  console.error('用法：node scripts/parts-sheet.mjs <_temp 目录 | response.json> [原图] [输出]');
   process.exit(1);
 }
+const runDir = statSync(arg).isDirectory() ? arg : null;
+const respPath = runDir ? join(runDir, 'response.json') : arg;
+const srcPath = process.argv[3] ?? (runDir && existsSync(join(runDir, 'source.png')) ? join(runDir, 'source.png') : 'test_assets/kkk.png');
+const outPath = process.argv[4] ?? 'docs/images/parts-sheet.png';
 const resp = JSON.parse(readFileSync(respPath, 'utf-8'));
 const cuts = resp.cutResults.filter((c) => !c.name.startsWith('_'));
 
 // ── 版式 ──
 const BG = '#0d1017', CARD = '#161b24', LINE = '#2a3240', TEXT = '#e6e9ef', MUTED = '#7d8796';
 const COLS = [
-  { key: 'mask', label: '归属蒙版', sub: 'MASK', color: [94, 234, 212], desc: '切图时归这个部件的像素（看得见的那部分）' },
-  { key: 'erased', label: '被擦除', sub: 'ERASED', color: [251, 146, 60], desc: '部件轮廓里被前面部件盖住、切掉的那片' },
-  { key: 'hidden', label: '被遮挡', sub: 'HIDDEN', color: [232, 121, 249], desc: '外扩 15% 的画布里被前面部件占着的位置，补图只在这里用模型画的' },
-  { key: 'model', label: '模型补画', sub: 'MODEL', desc: '模型画出的完整部件，已抠底并对齐到原图' },
-  { key: 'part', label: '最终部件', sub: 'PART', desc: '可见像素 + 被遮挡处的模型补画，进骨骼的就是它' },
+  { key: 'mask', label: '归属蒙版', sub: 'MASK', color: [94, 234, 212], desc: '切图时归这个部件的像素（看得见的那部分）', short: '切图时归它的可见像素' },
+  { key: 'erased', label: '被擦除', sub: 'ERASED', color: [251, 146, 60], desc: '部件轮廓里被前面部件盖住、切掉的那片', short: '被前面部件切掉的那片' },
+  { key: 'hidden', label: '被遮挡', sub: 'HIDDEN', color: [232, 121, 249], desc: '外扩 15% 的画布里被前面部件占着的位置，补图只在这里用模型画的', short: '补图画布里被挡住的位置' },
+  { key: 'model', label: '模型补画', sub: 'MODEL', desc: '模型画出的完整部件，已抠底并对齐到原图', short: '模型画的完整部件，已对齐' },
+  { key: 'part', label: '最终部件', sub: 'PART', desc: '可见像素 + 被遮挡处的模型补画，进骨骼的就是它', short: '可见像素 + 被挡处的补画' },
 ];
 // README 里整图会被缩到约 1000px 宽（约 0.25 倍），字号按缩小后还能读来定
 const PAD = 56, CW = 170, CH = 250, CGAP = 8, CARD_PAD = 14, HEAD_H = 54;
@@ -199,17 +204,28 @@ for (let k = 0; k < topCuts.length; k++) {
 }
 for (let j = 0; j < bottomCuts.length; j++) await card(bottomCuts[j], topCuts.length + j, colX(BOTTOM_START + j), bottomY);
 
-// 脚底那栏左边放图例
+// 图例：有脚底那栏就放它左边；没有的话，放上面最后一行空出来的格子里
+const topLeft = topCuts.length % (GRID_COLS - 1) ? (GRID_COLS - 1) - topCuts.length % (GRID_COLS - 1) : 0;
+let legend = null;
 if (bottomCuts.length && bottomCuts.length < GRID_COLS) {
-  const lx = colX(0), lw = colX(BOTTOM_START) - COL_GAP - lx;
-  bg += `<rect x="${lx}" y="${bottomY}" width="${lw}" height="${CARD_H}" rx="12" fill="${CARD}" stroke="${LINE}"/>`;
-  svg += `<text x="${lx + 36}" y="${bottomY + 62}" ${FONT} font-size="38" font-weight="600" fill="${TEXT}">图例 <tspan fill="${MUTED}" font-size="28" font-weight="400">LEGEND · 同一张卡片里五格按原图坐标对齐，掩码格垫了暗化的原图</tspan></text>`;
+  legend = { x: colX(0), y: bottomY, w: colX(BOTTOM_START) - COL_GAP - colX(0) };
+} else if (!bottomCuts.length && topLeft) {
+  const x = colX(GRID_COLS - topLeft);
+  legend = { x, y: rowY(TOP_ROWS - 1), w: colX(GRID_COLS) - COL_GAP - x };
+}
+if (legend) {
+  const { x: lx, y: ly, w: lw } = legend;
+  // 只剩一张卡片宽时放不下长说明，换短句
+  const narrow = lw < CARD_W * 1.5;
+  bg += `<rect x="${lx}" y="${ly}" width="${lw}" height="${CARD_H}" rx="12" fill="${CARD}" stroke="${LINE}"/>`;
+  const note = narrow ? '五格按原图坐标对齐' : '同一张卡片里五格按原图坐标对齐，掩码格垫了暗化的原图';
+  svg += `<text x="${lx + 36}" y="${ly + 62}" ${FONT} font-size="38" font-weight="600" fill="${TEXT}">图例 <tspan fill="${MUTED}" font-size="28" font-weight="400">LEGEND · ${note}</tspan></text>`;
   const step = (CARD_H - 100) / COLS.length;
   COLS.forEach((col, i) => {
-    const y = bottomY + 100 + i * step + step / 2;
+    const y = ly + 100 + i * step + step / 2;
     svg += `<rect x="${lx + 36}" y="${y - 15}" width="30" height="30" rx="7" fill="${colorOf(col)}"/>`;
     svg += `<text x="${lx + 84}" y="${y + 11}" ${FONT} font-size="30" font-weight="600" fill="${TEXT}">${col.label}</text>`;
-    svg += `<text x="${lx + 84 + 150}" y="${y + 11}" ${FONT} font-size="28" fill="${MUTED}">${col.sub} · ${col.desc}</text>`;
+    svg += `<text x="${lx + 84 + 150}" y="${y + 11}" ${FONT} font-size="28" fill="${MUTED}">${col.sub} · ${narrow ? col.short : col.desc}</text>`;
   });
 }
 

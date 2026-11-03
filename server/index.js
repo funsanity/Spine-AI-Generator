@@ -34,7 +34,7 @@ import { getSam3Client, stopSam3Client, sam3Paths } from './sam/client-sam3.mjs'
 import { segmentParts } from './sam/segment.mjs';
 import { execFile, spawn } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
-import { stat, writeFile } from 'fs/promises';
+import { stat, writeFile, readFile } from 'fs/promises';
 import { promisify } from 'util';
 
 /*
@@ -1062,7 +1062,7 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     );
 
     // 4. 返回预览数据（骨骼 + 动画 + 切图结果）
-    res.json({
+    const response = {
       success: true,
       sessionId: Date.now(),
       skeleton,
@@ -1095,7 +1095,18 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
       // 前端贴图要用的 URL。磁盘路径在静态目录外时为 null
       imagesUrl: toPublicUrl(imagesDir),
       artifacts: await listArtifacts(workspace.projectDir)
-    });
+    };
+    // 和切图并排留一份这次的完整响应和切图用的源图（去过背景的那张），
+    // 事后出部件拆解图（scripts/parts-sheet.mjs <_temp 目录>）就不用再跑一遍 AI。
+    // uploads/ 里的源图是临时文件，不能指望它还在。
+    try {
+      const runDir = dirname(imagesDir);
+      await writeFile(join(runDir, 'source.png'), await readFile(imagePath));
+      await writeFile(join(runDir, 'response.json'), JSON.stringify(response));
+    } catch (e) {
+      broadcastLog(`保存本次响应失败（不影响结果）: ${e.message}`, 'warning');
+    }
+    res.json(response);
 
   } catch (error) {
     broadcastLog(`✗ 生成失败: ${error.message}`, 'error');

@@ -163,14 +163,12 @@ export async function buildBasePlate(sourcePath, cutResults, outputDir, opts = {
    * 是同一个坑。
    */
   const maskPath = join(outputDir, `${BASE_PLATE_NAME}.erased.png`);
+  //
+  // 格式和 cutter 写的 .erased.png 一致：alpha 就是掩码，RGB 全 0。
+  // 以前写成「RGB 白 = 洞、alpha 全 255」，而补图按 alpha 读——整张画布都成了洞，
+  // 模型把底板整张重画（实测画出一个木头底座，盖在人物后面）。
   const maskBuf = Buffer.alloc(W * H * 4);
-  for (let i = 0; i < W * H; i++) {
-    const v = holes[i] ? 255 : 0;
-    maskBuf[i * 4] = v;
-    maskBuf[i * 4 + 1] = v;
-    maskBuf[i * 4 + 2] = v;
-    maskBuf[i * 4 + 3] = 255;
-  }
+  for (let i = 0; i < W * H; i++) if (holes[i]) maskBuf[i * 4 + 3] = 255;
   await sharp(maskBuf, { raw: { width: W, height: H, channels: 4 } })
     .png()
     .toFile(maskPath);
