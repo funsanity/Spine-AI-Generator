@@ -78,6 +78,37 @@ export const EXPORT_TARGETS = {
     skinsShape: 'array',
     rotateKey: 'value',
     note: 'Cocos Creator 3.8.4+ 也可用 Spine 4.2 运行时'
+  },
+  /*
+   * 下面三个 Web 引擎读的都是标准 Spine JSON，和上面没有格式差异，
+   * 只是各自运行时绑定的版本不同——版本头对不上，运行时会拒绝加载。
+   *
+   * LayaAir 走 3.8：2.x 只认到 3.8/4.0，3.x 也仍支持 3.8，这一档两代都能用。
+   * Phaser / PixiJS 走 4.2：官方 spine-phaser、spine-pixi 跟随编辑器 4.2 线。
+   */
+  'layaair': {
+    label: 'LayaAir (Spine 3.8)',
+    spineHeader: '3.8.75',
+    atlasVersion: '3.8',
+    skinsShape: 'object',
+    rotateKey: 'angle',
+    note: 'LayaAir 2.x / 3.x 用 Spine 3.8 运行时加载：三件套放 bin（3.x 为 assets）下同目录，用 SpineTempletBinary / Spine2DRenderNode 加载 .json'
+  },
+  'phaser': {
+    label: 'Phaser 3 (spine-phaser 4.2)',
+    spineHeader: '4.2.10',
+    atlasVersion: '4.2',
+    skinsShape: 'array',
+    rotateKey: 'value',
+    note: '需 Phaser 3.60+ 和官方 @esotericsoftware/spine-phaser 4.2 插件：load.spineJson + load.spineAtlas 后 add.spine'
+  },
+  'pixijs': {
+    label: 'PixiJS (spine-pixi 4.2)',
+    spineHeader: '4.2.10',
+    atlasVersion: '4.2',
+    skinsShape: 'array',
+    rotateKey: 'value',
+    note: 'PixiJS v7 用 @esotericsoftware/spine-pixi-v7，v8 用 spine-pixi-v8（均为 4.2）：Assets.load 三件套后 Spine.from'
   }
 };
 

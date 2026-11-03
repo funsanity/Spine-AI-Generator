@@ -38,7 +38,9 @@ const GRID_COLS = 4, COL_GAP = 48, ROW_GAP = 18;
 const TOP_ROWS = Math.min(4, Math.ceil(cuts.length / (GRID_COLS - 1)));
 const topCuts = cuts.slice(0, TOP_ROWS * (GRID_COLS - 1));
 const bottomCuts = cuts.slice(topCuts.length);
-const TITLE_H = 100, COLHEAD_H = 60;
+// 脚底那栏的卡片靠右，和上面最后几列对齐；左边空出来放图例
+const BOTTOM_START = GRID_COLS - bottomCuts.length;
+const TITLE_H = 100, COLHEAD_H = 86;
 const colX = (c) => PAD + c * (CARD_W + COL_GAP);
 
 const srcTop = PAD + TITLE_H;
@@ -128,17 +130,18 @@ let svg = '', bg = '';
 
 // 标题
 svg += `<text x="${PAD}" y="${PAD + 60}" ${FONT} font-size="68" font-weight="700" fill="${TEXT}">部件拆解</text>`;
-svg += `<text x="${PAD + 304}" y="${PAD + 60}" ${FONT} font-size="36" fill="${MUTED}">LAYER BREAKDOWN · ${cuts.length} parts · 切图 → 补图</text>`;
+svg += `<text x="${PAD + 304}" y="${PAD + 60}" ${FONT} font-size="36" fill="${MUTED}">LAYER BREAKDOWN · ${cuts.length} parts · 切图 CUT → 补图 INPAINT</text>`;
 
 // 列头：每列卡片上方标一次，卡片里就不用每格写字
 function colHeads(cx, y) {
   for (let i = 0; i < COLS.length; i++) {
     const x = cx + CARD_PAD + i * (CW + CGAP) + CW / 2;
     svg += `<text x="${x}" y="${y}" ${FONT} font-size="30" font-weight="600" fill="${colorOf(COLS[i])}" text-anchor="middle">${COLS[i].label}</text>`;
+    svg += `<text x="${x}" y="${y + 30}" ${FONT} font-size="22" font-weight="600" letter-spacing="2" fill="${colorOf(COLS[i])}" opacity="0.7" text-anchor="middle">${COLS[i].sub}</text>`;
   }
 }
-for (let c = 1; c < GRID_COLS; c++) colHeads(colX(c), srcTop + 42);
-for (let j = 0; j < bottomCuts.length; j++) colHeads(colX(j), rowEnd + 42);
+for (let c = 1; c < GRID_COLS; c++) colHeads(colX(c), srcTop + 38);
+for (let j = 0; j < bottomCuts.length; j++) colHeads(colX(BOTTOM_START + j), rowEnd + 38);
 
 // 原图
 bg += `<rect x="${PAD}" y="${srcTop}" width="${CARD_W}" height="${PANEL_H}" rx="14" fill="${CARD}" stroke="${LINE}"/>`;
@@ -146,22 +149,20 @@ const srcBuf = await sharp(srcTrim).resize(SRC_W, SRC_H).png().toBuffer();
 composites.push({ input: srcBuf, left: PAD + Math.round((CARD_W - SRC_W) / 2), top: srcTop + Math.round((PANEL_H - SRC_H) / 2) });
 svg += `<text x="${PAD + 22}" y="${srcTop + 52}" ${FONT} font-size="32" font-weight="600" fill="#ffffff" opacity="0.85">原图 SOURCE</text>`;
 
-// 树干：原图右侧竖线，每行一条分支；脚底那栏左右各分一支
+// 树干：原图右侧竖线，每行一条分支（脚底那栏在图例右边，不接树干）
 const line = (d) => (svg += `<path d="${d}" stroke="${LINE}" stroke-width="3" fill="none"/>`);
 const dot = (x, y) => (svg += `<circle cx="${x}" cy="${y}" r="6" fill="#3b4656"/>`);
 const trunkX = colX(1) - COL_GAP / 2;
 const mid = (y) => y + CARD_H / 2;
-const lastMid = bottomCuts.length ? mid(bottomY) : mid(rowY(TOP_ROWS - 1));
+const lastMid = mid(rowY(TOP_ROWS - 1));
 line(`M${PAD + CARD_W} ${srcTop + PANEL_H / 2} H${trunkX}`);
 line(`M${trunkX} ${mid(rowY(0))} V${lastMid}`);
 for (let r = 0; r < TOP_ROWS; r++) { line(`M${trunkX} ${mid(rowY(r))} H${colX(1)}`); dot(trunkX, mid(rowY(r))); }
-if (bottomCuts.length) {
-  line(`M${PAD + CARD_W} ${lastMid} H${bottomCuts.length > 1 ? colX(1) : trunkX}`);
-  dot(trunkX, lastMid);
-}
 
 // 卡片
 const check = checker(CW, CH);
+// 最终部件那格垫亮一档，一眼看出是成品
+const checkPart = checker(CW, CH, '#3a4352', '#444e5f');
 async function card(cut, k, cx, cy) {
   bg += `<rect x="${cx}" y="${cy}" width="${CARD_W}" height="${CARD_H}" rx="12" fill="${CARD}" stroke="${LINE}"/>`;
   svg += `<text x="${cx + CARD_PAD + 4}" y="${cy + CARD_PAD + 36}" ${FONT} font-size="38" font-weight="600" fill="${TEXT}">${esc(cut.name)}</text>`;
@@ -180,15 +181,15 @@ async function card(cut, k, cx, cy) {
   for (let i = 0; i < COLS.length; i++) {
     const col = COLS[i];
     const x = cx + CARD_PAD + i * (CW + CGAP), y = cy + CARD_PAD + HEAD_H;
-    composites.push({ input: check, left: x, top: y });
+    composites.push({ input: col.key === 'part' ? checkPart : check, left: x, top: y });
     const l = layers[col.key];
     if (l) {
       const img = place(U, await loadRGBA(l[0]), l[1], { tint: col.color, ghost: !!col.color });
       const f = await fit(img, CW - 8, CH - 8);
       composites.push({ input: f.buf, left: x + Math.round((CW - f.w) / 2), top: y + Math.round((CH - f.h) / 2) });
     } else {
-      const why = col.key === 'model' ? '没被挡' : '无';
-      svg += `<text x="${x + CW / 2}" y="${y + CH / 2 + 10}" ${FONT} font-size="28" fill="#4a5363" text-anchor="middle">${why}</text>`;
+      const why = col.key === 'model' ? 'NOT OCCLUDED' : 'NONE';
+      svg += `<text x="${x + CW / 2}" y="${y + CH / 2 + 10}" ${FONT} font-size="20" fill="#5a6577" text-anchor="middle">${why}</text>`;
     }
     svg += `<rect x="${x + 0.5}" y="${y + 0.5}" width="${CW - 1}" height="${CH - 1}" rx="6" fill="none" stroke="${LINE}"/>`;
   }
@@ -196,11 +197,11 @@ async function card(cut, k, cx, cy) {
 for (let k = 0; k < topCuts.length; k++) {
   await card(topCuts[k], k, colX(1 + (k % (GRID_COLS - 1))), rowY(Math.floor(k / (GRID_COLS - 1))));
 }
-for (let j = 0; j < bottomCuts.length; j++) await card(bottomCuts[j], topCuts.length + j, colX(j), bottomY);
+for (let j = 0; j < bottomCuts.length; j++) await card(bottomCuts[j], topCuts.length + j, colX(BOTTOM_START + j), bottomY);
 
-// 脚底那栏剩下的位置放图例
+// 脚底那栏左边放图例
 if (bottomCuts.length && bottomCuts.length < GRID_COLS) {
-  const lx = colX(bottomCuts.length), lw = colX(GRID_COLS) - COL_GAP - lx;
+  const lx = colX(0), lw = colX(BOTTOM_START) - COL_GAP - lx;
   bg += `<rect x="${lx}" y="${bottomY}" width="${lw}" height="${CARD_H}" rx="12" fill="${CARD}" stroke="${LINE}"/>`;
   svg += `<text x="${lx + 36}" y="${bottomY + 62}" ${FONT} font-size="38" font-weight="600" fill="${TEXT}">图例 <tspan fill="${MUTED}" font-size="28" font-weight="400">LEGEND · 同一张卡片里五格按原图坐标对齐，掩码格垫了暗化的原图</tspan></text>`;
   const step = (CARD_H - 100) / COLS.length;

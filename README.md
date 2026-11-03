@@ -2,10 +2,17 @@
 
 **[English](README-EN.md) | 中文**
 
+<p>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white" alt="node">
+  <img src="https://img.shields.io/badge/Spine-3.8%20%7C%204.x-ff4000" alt="spine">
+  <img src="https://img.shields.io/badge/export-Cocos%20%7C%20Unity%20%7C%20LayaAir%20%7C%20Phaser%20%7C%20PixiJS-6f42c1" alt="export">
+</p>
+
 把一张 2D 立绘**自动拆成部件、生成骨架、导出成 Spine 工程**的本地工具。
 
 上传一张图 → AI 判断有哪些部件、谁压着谁 → 像素级切图 → 生成骨骼层级 → 一键导出成
-目标平台的 Spine 资源（Cocos / Unity / Spine 编辑器各版本），外加一个能直接进 Spine
+目标平台的 Spine 资源（Cocos / Unity / LayaAir / Phaser / PixiJS / Spine 编辑器各版本），外加一个能直接进 Spine
 编辑器二次编辑的 `.spine` 工程。
 
 <p align="center">
@@ -15,8 +22,6 @@
 <p align="center">
   <img src="docs/images/parts-sheet.png" width="100%" alt="部件拆解：左边原图，右边每个部件按流程排五格——归属蒙版、被擦除、被遮挡、模型补画、最终部件">
 </p>
-
-<sub>部件拆解图由 <code>node scripts/parts-sheet.mjs &lt;response.json&gt;</code> 生成，response.json 是 <code>/api/generate</code> 的完整响应。</sub>
 
 ---
 
@@ -114,7 +119,7 @@
    ▼
 阶段 4：动画 + 导出
    │  ├─ 生成 idle（站立呼吸：整个角色以鞋底为锚纵向伸缩约 1.3%，所有部件同一个变换、接缝不会裂；只有头轻晃 0.6°）
-   │  ├─ 按目标平台转格式：Cocos / Unity / Spine 4.0–4.2
+   │  ├─ 按目标平台转格式：Cocos / Unity / LayaAir / Phaser / PixiJS / Spine 4.0–4.2
    │  │     版本差异：3.8 用 angle、4.0+ 用 value；skins 一个是对象一个是数组
    │  ├─ 打图集、权重内联进 vertices 流
    │  └─ 调 Spine 编辑器 CLI 生成 .spine
@@ -228,7 +233,7 @@ MobileSAM 只吃框，而框里几乎总装着好几件东西，它只挑最显�
 |---|---|---|
 | 1 | 上传立绘 PNG | 读出尺寸，建立像素坐标系 |
 | 2 | 输入提示词，描述部件结构与旋转中心 | 提示词质量直接决定部件表质量，[见下](#提示词怎么写) |
-| 3 | 选目标平台（Cocos 3.8 / Unity / Spine 4.0–4.2） | 决定骨架版本号、旋转字段名和 skins 形状 |
+| 3 | 选目标平台（Cocos 3.8 / Unity / LayaAir / Phaser / PixiJS / Spine 4.0–4.2） | 决定骨架版本号、旋转字段名和 skins 形状 |
 | 4 | 点「生成」 | 走阶段 0→3，日志面板实时输出 |
 | 5 | 在预览区看拼装结果、切播放看 idle 动画 | 有缝/有异色就能立刻发现 |
 | 6 | 点「导出」 | 走阶段 4，产出目标平台资源 + `.spine` |
@@ -269,25 +274,6 @@ MobileSAM 只吃框，而框里几乎总装着好几件东西，它只挑最显�
 - **层级**：口诀「盖人的当儿子，被盖的当父亲」——被遮住的当父级（先画），遮人的当子级（后画）
 - **bbox 外扩**：边缘比可见内容再外扩 3~5 px 把轮廓线包进来，宁可多框 5 px 不少框 1 px
 - **pivot**：写在真实的关节上，不是部件的几何中心
-
-### 一组实测参数
-
-下面这组是仓库里 `test_assets/12.png` 跑完整条流程用的配置，界面上每个字段都对应得到：
-
-| 项 | 值 |
-|---|---|
-| 分析模型 | `claude-opus-5`（视觉模型，出部件表） |
-| 提示词模板 | 物品类——「好漂亮的水果拼盘」 |
-| 补图模型 | `gpt-image-2`（同步接口，可带 mask 传本地图） |
-| 像素级分割 | MobileSAM，权重约 40 MB |
-| 网格粒度 | 8（每个部件的栅格剖分密度） |
-| 输出目录 | `./output/generated` |
-| 导出目标 | `cocos-3.8`（骨架 3.8.75，旋转字段用 `angle`） |
-| 产物 | 7 个部件 → 5 个加权网格 + 2 个 region；图集 1024×436 |
-| 动画 | 只有 `idle` |
-
-> `gpt-image-2` 是**网关侧的模型码**，不是我们要绑定的东西——换服务商时它和白名单
-> 一起在界面上重选，`config/api-defaults.json` 里只放接入点地址。
 
 ---
 
@@ -467,13 +453,6 @@ scripts/                  工具脚本
 docs/                     文档与配图
 config/                   prompt-templates.json、api-defaults.json
 temp/test/                测试
-```
-
-### 跑测试
-
-```bash
-npm test                 # 快，不碰网络
-npm run test:e2e         # 慢，真调 API，验证完整链路
 ```
 
 `src/` 下的 Spine 读写库可以独立使用——它不依赖 server，做骨架格式转换很方便。
